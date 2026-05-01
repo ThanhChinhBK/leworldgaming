@@ -1,8 +1,46 @@
+# Architecture
 latent_dim: 256
 action_dim: 56
-batch_size: 64
+projector_hidden: 2048
+history_size: 3
+
+# Encoder (ViT-tiny: depth=12, dim=192, heads=3, mlp_ratio=4).
+# Drop encoder_depth to 6 for fast MPS iteration.
+encoder_image_size: 224
+encoder_patch_size: 16
+encoder_embed_dim: 192
+encoder_depth: 12
+encoder_heads: 3
+encoder_mlp_ratio: 4.0
+encoder_dropout: 0.0
+
+# Predictor (LeWM AR transformer with AdaLN-zero action conditioning).
+predictor_depth: 6
+predictor_heads: 16
+predictor_dim_head: 64
+predictor_mlp_dim: 2048
+predictor_dropout: 0.1
+
+# Optimization
+batch_size: 16
 lr: 3.0e-4
+weight_decay: 1.0e-3
+grad_clip: 1.0
+
+# Loss
 sigreg_lambda: 0.1
+sigreg_knots: 17
+sigreg_num_proj: 1024
+
+# Data + I/O
+data_path: data/replay.h5
+ckpt_path: data/lewm_checkpoint.pt
+log_every: 10
+val_split: 0.1
+val_every: 25
+seed: 0
+
+# Inference-time planner (not used by train_lewm.py)
 planner:
   horizon: 5
   num_samples: 64
