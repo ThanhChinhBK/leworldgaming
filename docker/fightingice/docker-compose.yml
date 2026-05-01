@@ -1,0 +1,50 @@
+# Headless DareFightingICE JVM game engine.
+#
+# This compose file is ONLY for the third-party game. The leworldgaming
+# Python research code is NOT containerized — run it natively under `uv`.
+#
+# Usage:
+#   docker compose -f docker/fightingice/docker-compose.yml up
+#   # then in another terminal:
+#   uv run python scripts/collect_data.py --port 31415
+#
+# Image: https://github.com/orgs/TeamFightingICE/packages/container/package/fightingice
+# Flags reference: gemini_research.md §2 and FightingICE README.
+
+services:
+  fightingice:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: leworldgaming/fightingice:latest
+    container_name: fightingice
+    ports:
+      - "31415:31415"
+      # VNC port — only used when MODE=watch. Bound to localhost only.
+      - "127.0.0.1:5900:5900"
+    environment:
+      # MODE selects the rendering/monitoring profile:
+      #   fast   — no rendering, ScreenData empty (default; state-vector training)
+      #   pixels — full rendering, pixels in ScreenData (LeWM data collection)
+      #   watch  — full rendering + VNC on :5900 (monitor on Mac)
+      # Also accepts legacy LIGHTWEIGHT_MODE=0/1 for back-compat.
+      MODE: "${MODE:-fast}"
+      # VNC password for MODE=watch. macOS Screen Sharing refuses passwordless
+      # servers; the port is localhost-only so this is just a protocol stub.
+      VNC_PASSWORD: "${VNC_PASSWORD:-watch}"
+      # OpenAL Soft `null` driver — game requires sound init in render mode
+      # but we don't have a real audio device in the container.
+      ALSOFT_DRIVERS: "null"
+    command:
+      - "--limithp"
+      - "400"
+      - "400"
+      - "--pyftg-mode"
+      - "--input-sync"
+      - "--inverted-player"
+      - "1"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    restart: "no"

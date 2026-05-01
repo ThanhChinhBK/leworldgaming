@@ -1,0 +1,6 @@
+batch_size: 16
+batch_length: 64
+imag_horizon: 15
+lr_world_model: 1.0e-4
+lr_actor: 3.0e-5
+lr_critic: 3.0e-5

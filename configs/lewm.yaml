@@ -1,0 +1,8 @@
+latent_dim: 256
+action_dim: 56
+batch_size: 64
+lr: 3.0e-4
+sigreg_lambda: 0.1
+planner:
+  horizon: 5
+  num_samples: 64

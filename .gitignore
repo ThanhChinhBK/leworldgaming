@@ -1,0 +1,25 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.ruff_cache/
+.python-version.local
+
+# Data & artifacts
+data/
+checkpoints/
+runs/
+*.h5
+*.lmdb
+*.pt
+*.ckpt
+
+# Native FightingICE install (downloaded by scripts/fetch_native.sh)
+vendor/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+.ipynb_checkpoints/
