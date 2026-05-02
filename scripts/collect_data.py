@@ -5,10 +5,12 @@ stream that captures downsampled framebuffers.
 Start the game first (`make game-native` on Mac, `make game` on Linux),
 then run this in another terminal.
 
-Supports playing against built-in JVM AIs (MctsAi, KickAI, Sandbox) by
-passing their name as ``--policy-p1`` or ``--policy-p2``. When a JVM AI
-name is detected, no Python agent is created for that slot — the game
-engine loads the Java AI directly."""
+Supports playing against built-in JVM AIs (MctsAi23i, MctsAiZoning — the
+ones shipped in DareFightingICE 7.1's data/ai/) by passing their class
+name as ``--policy-p1`` or ``--policy-p2``. When a JVM AI name is
+detected, no Python agent is created for that slot — in --pyftg-mode the
+engine resolves the name against the classpath and instantiates the AI
+server-side."""
 
 from __future__ import annotations
 
@@ -27,10 +29,11 @@ from leworldgaming.env.policies import make_policy
 from leworldgaming.env.recording_ai import RecordingAI
 from leworldgaming.env.spectator_recorder import SpectatorRecorder
 
-# Built-in JVM AI names that the DareFightingICE engine can load directly.
-# When one of these is passed as --policy-p1/p2, we don't create a Python agent
-# for that slot — the game engine handles it server-side.
-JVM_AIS = {"mctsai", "kickai", "sandbox", "thunder", "blindai", "erhea_pi"}
+# Built-in JVM AI class names shipped in vendor/fightingice/data/ai/*.jar.
+# When one of these is passed as --policy-p1/p2, we don't create a Python
+# agent for that slot — in --pyftg-mode the JVM resolves the name against
+# the classpath and instantiates the AI in-process.
+JVM_AIS = {"mctsai23i", "mctsaizoning"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,11 +41,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--games", type=int, default=1, help="Number of games to play")
     parser.add_argument("--character", type=str, default="ZEN")
     parser.add_argument("--policy-p1", type=str, default="random",
-                        help="P1 policy: 'random', 'noop', or a JVM AI name "
-                             "(MctsAi, KickAI, Sandbox, Thunder)")
+                        help="P1 policy: 'random', 'noop', or a JVM AI class name "
+                             "bundled in vendor/fightingice/data/ai/ "
+                             "(MctsAi23i, MctsAiZoning)")
     parser.add_argument("--policy-p2", type=str, default="random",
-                        help="P2 policy: 'random', 'noop', or a JVM AI name "
-                             "(MctsAi, KickAI, Sandbox, Thunder)")
+                        help="P2 policy: 'random', 'noop', or a JVM AI class name "
+                             "bundled in vendor/fightingice/data/ai/ "
+                             "(MctsAi23i, MctsAiZoning)")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=31415)
     parser.add_argument("--out", type=str, default="data/replay.h5")

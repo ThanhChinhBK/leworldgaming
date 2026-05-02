@@ -73,27 +73,39 @@ make game-pixels                    # terminal 1
 uv run python scripts/collect_data.py --games 5 --pixels   # terminal 2
 ```
 
-**Play against built-in JVM AIs** for diverse, structured training data:
+### Policy options for `--policy-p1` / `--policy-p2`
+
+| Value | What it is | Where it runs |
+|---|---|---|
+| `random` | Uniform over the 40 playable actions, sticky for 8 frames (see `env/policies.py`) | Python (pyftg client) |
+| `noop` (alias `neutral`) | Always `Action.NEUTRAL` — passive baseline | Python (pyftg client) |
+| `MctsAi23i` | Iteration-capped MCTS, the canonical DareFightingICE 7.x training opponent | JVM (loaded server-side from `vendor/fightingice/data/ai/MctsAi23i.jar`) |
+| `MctsAiZoning` | MCTS variant with zoning heuristics | JVM (`MctsAiZoning.jar`) |
+
+When a JVM AI name is passed, `collect_data.py` does **not** spin up a Python agent for that slot — in `--pyftg-mode` the engine resolves the class name against `data/ai/*.jar` and instantiates it in-process. At least one slot must be a Python policy so transitions get recorded.
+
+> Older AIs (`MctsAi`, `KickAI`, `Sandbox`, `Thunder`, `BlindAI`, `ErheaPi`) are **not** bundled in DareFightingICE 7.1 — only the two MCTS jars above are. To use others, drop their compiled `.jar` into `vendor/fightingice/data/ai/` and add the class name to `JVM_AIS` in `scripts/collect_data.py`.
+
+**Examples:**
 
 ```bash
-# Record our random P1 vs the game's built-in MCTS AI
-uv run python scripts/collect_data.py --games 30 --pixels --policy-p2 MctsAi
+# Random P1 vs the canonical MCTS opponent (BlindAI-paper recipe)
+uv run python scripts/collect_data.py --games 30 --pixels --policy-p2 MctsAi23i
 
-# Record vs simple kicker (aggressive baseline)
-uv run python scripts/collect_data.py --games 30 --pixels --policy-p2 KickAI
+# Random P1 vs MCTS-with-zoning (different distribution of states)
+uv run python scripts/collect_data.py --games 30 --pixels --policy-p2 MctsAiZoning
 
-# Record vs passive dummy
-uv run python scripts/collect_data.py --games 30 --pixels --policy-p2 Sandbox
-
-# Self-play random (maximum entropy)
+# Self-play random (maximum entropy, no JVM AI involved)
 uv run python scripts/collect_data.py --games 30 --pixels
-```
 
-Available JVM AIs: `MctsAi` (MCTS), `KickAI` (kicks only), `Sandbox` (passive), `Thunder`, `BlindAI`.
+# MCTS-vs-random with --no-record-p2 to halve storage
+uv run python scripts/collect_data.py --games 30 --pixels \
+    --policy-p1 MctsAi23i --policy-p2 random --no-record-p2
+```
 
 This writes `data/replay.h5` containing `pixels (N,3,224,224)`, `action`, `done`, `episode_starts`, etc.
 
-> **Tip:** Mix opponents for diversity. 100 games split across 3–4 JVM AIs gives much better coverage than 100 games of random-vs-random.
+> **Tip:** Mix opponents for diversity. Splitting a 100-game run across `MctsAi23i`, `MctsAiZoning`, and self-play random gives broader state coverage than 100 games of any single matchup.
 
 ### 2. Train
 
