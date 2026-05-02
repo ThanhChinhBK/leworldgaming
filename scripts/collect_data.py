@@ -3,7 +3,12 @@ to an HDF5 replay buffer. Pass `--pixels` to also subscribe a spectator
 stream that captures downsampled framebuffers.
 
 Start the game first (`make game-native` on Mac, `make game` on Linux),
-then run this in another terminal."""
+then run this in another terminal.
+
+Supports playing against built-in JVM AIs (MctsAi, KickAI, Sandbox) by
+passing their name as ``--policy-p1`` or ``--policy-p2``. When a JVM AI
+name is detected, no Python agent is created for that slot — the game
+engine loads the Java AI directly."""
 
 from __future__ import annotations
 
@@ -22,13 +27,22 @@ from leworldgaming.env.policies import make_policy
 from leworldgaming.env.recording_ai import RecordingAI
 from leworldgaming.env.spectator_recorder import SpectatorRecorder
 
+# Built-in JVM AI names that the DareFightingICE engine can load directly.
+# When one of these is passed as --policy-p1/p2, we don't create a Python agent
+# for that slot — the game engine handles it server-side.
+JVM_AIS = {"mctsai", "kickai", "sandbox", "thunder", "blindai", "erhea_pi"}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--games", type=int, default=1, help="Number of games to play")
     parser.add_argument("--character", type=str, default="ZEN")
-    parser.add_argument("--policy-p1", type=str, default="random")
-    parser.add_argument("--policy-p2", type=str, default="random")
+    parser.add_argument("--policy-p1", type=str, default="random",
+                        help="P1 policy: 'random', 'noop', or a JVM AI name "
+                             "(MctsAi, KickAI, Sandbox, Thunder)")
+    parser.add_argument("--policy-p2", type=str, default="random",
+                        help="P2 policy: 'random', 'noop', or a JVM AI name "
+                             "(MctsAi, KickAI, Sandbox, Thunder)")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=31415)
     parser.add_argument("--out", type=str, default="data/replay.h5")
@@ -58,29 +72,50 @@ async def run(args: argparse.Namespace) -> None:
     if args.pixels:
         spectator = SpectatorRecorder(image_size=args.image_size)
 
-    p1 = RecordingAI(
-        name="LWG_P1",
-        policy=make_policy(args.policy_p1, seed=args.seed),
-        buffer=buffer,
-        record=True,
-        pixel_source=spectator,
-    )
-    p2 = RecordingAI(
-        name="LWG_P2",
-        policy=make_policy(args.policy_p2, seed=args.seed + 1),
-        buffer=buffer,
-        record=not args.no_record_p2,
-        pixel_source=spectator,
-    )
+    p1_is_jvm = args.policy_p1.lower() in JVM_AIS
+    p2_is_jvm = args.policy_p2.lower() in JVM_AIS
+
+    if p1_is_jvm and p2_is_jvm:
+        raise SystemExit(
+            "Both P1 and P2 are JVM AIs — at least one must be a Python policy "
+            "to record transitions."
+        )
 
     gateway = Gateway(host=args.host, port=args.port)
-    gateway.register_ai("LWG_P1", p1)
-    gateway.register_ai("LWG_P2", p2)
+    agent_names: list[str] = []
+
+    if p1_is_jvm:
+        agent_names.append(args.policy_p1)  # pass JVM name directly
+    else:
+        p1 = RecordingAI(
+            name="LWG_P1",
+            policy=make_policy(args.policy_p1, seed=args.seed),
+            buffer=buffer,
+            record=True,
+            pixel_source=spectator,
+        )
+        gateway.register_ai("LWG_P1", p1)
+        agent_names.append("LWG_P1")
+
+    if p2_is_jvm:
+        agent_names.append(args.policy_p2)  # pass JVM name directly
+    else:
+        p2 = RecordingAI(
+            name="LWG_P2",
+            policy=make_policy(args.policy_p2, seed=args.seed + 1),
+            buffer=buffer,
+            record=not args.no_record_p2,
+            pixel_source=spectator,
+        )
+        gateway.register_ai("LWG_P2", p2)
+        agent_names.append("LWG_P2")
+
+    logging.info("agents: P1=%s  P2=%s", agent_names[0], agent_names[1])
 
     game_task = asyncio.create_task(
         gateway.run_game(
             characters=[args.character, args.character],
-            agents=["LWG_P1", "LWG_P2"],
+            agents=agent_names,
             game_number=args.games,
         )
     )

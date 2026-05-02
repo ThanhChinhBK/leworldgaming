@@ -73,9 +73,27 @@ make game-pixels                    # terminal 1
 uv run python scripts/collect_data.py --games 5 --pixels   # terminal 2
 ```
 
+**Play against built-in JVM AIs** for diverse, structured training data:
+
+```bash
+# Record our random P1 vs the game's built-in MCTS AI
+uv run python scripts/collect_data.py --games 30 --pixels --policy-p2 MctsAi
+
+# Record vs simple kicker (aggressive baseline)
+uv run python scripts/collect_data.py --games 30 --pixels --policy-p2 KickAI
+
+# Record vs passive dummy
+uv run python scripts/collect_data.py --games 30 --pixels --policy-p2 Sandbox
+
+# Self-play random (maximum entropy)
+uv run python scripts/collect_data.py --games 30 --pixels
+```
+
+Available JVM AIs: `MctsAi` (MCTS), `KickAI` (kicks only), `Sandbox` (passive), `Thunder`, `BlindAI`.
+
 This writes `data/replay.h5` containing `pixels (N,3,224,224)`, `action`, `done`, `episode_starts`, etc.
 
-> **Tip:** More games = more valid training sequences. 5+ games gives a few thousand frames to start.
+> **Tip:** Mix opponents for diversity. 100 games split across 3–4 JVM AIs gives much better coverage than 100 games of random-vs-random.
 
 ### 2. Train
 
