@@ -46,7 +46,19 @@ uv run python scripts/collect_data.py --games 1 --pixels                   # + 2
 uv run python scripts/collect_data.py --games 1 --pixels --image-size 84   # smaller pixels (faster on Mac)
 ```
 
-Output: `data/replay.h5` with datasets `state_vector / action / reward / done / hp_self / hp_opp / frame_idx / episode_starts` (and `pixels` when `--pixels` is set).
+Output: `data/replay.h5` with raw primitives stored in named groups so a single collection feeds all three trainers (LeWM / Dreamer / PETS) via per-method dataloader views in `src/leworldgaming/data/views.py`:
+
+```
+obs/own/{hp,energy,x,y,speed_x,speed_y,state,front,control,
+         remaining_frame,hit_confirm,
+         atk_is_live,atk_start_up,atk_active,atk_hit_damage,atk_type}
+obs/opp/{...mirrored...}
+obs/global/{current_round,current_frame,proj_self,proj_opp,max_hp,max_energy}
+action  reward  done  is_first  cont  episode_starts
+pixels (only when --pixels is set; uint8, CHW)
+```
+
+`is_first` flags episode boundaries (Dreamer requires this to reset the RSSM hidden state); `cont` is `1 − done`.
 
 ## Inspect data
 
@@ -170,11 +182,43 @@ ViT-12 encoder (5.57M) → Projector (1.05M) → AR Predictor (14.97M) → pred_
 
 The AR predictor uses causal self-attention + AdaLN-zero conditioning on per-step action embeddings, so one forward pass yields `T` parallel next-step predictions during training.
 
+## Train DreamerV3 (offline)
+
+The vendored `external/dreamerv3-torch` runs purely from the same HDF5 replay — no live env needed. The trainer exports each episode to a per-episode `.npz` file once (cached in `data/dreamer_episodes/`), then drives `WorldModel._train` + `ImagBehavior._train` directly:
+
+```bash
+uv run python scripts/collect_data.py --games 5 --pixels      # produce data/replay.h5
+uv run python -m leworldgaming.training.train_dreamer --num-steps 1000
+```
+
+Defaults in `configs/dreamer.yaml`: pixels at 64×64 (Dreamer convention; auto-downsampled from collection size), batch 16×64, model_lr 1e-4, actor/critic_lr 3e-5, imag_horizon 15. Online play through `DreamerAgent.act()` is gated on `FightingIceEnv` — for now `act()` raises `NotImplementedError`.
+
+## Train PETS (state-vector ensemble)
+
+Probabilistic-ensemble dynamics over the 26-d continuous state primitives (`PETS_STATE_DIM`), discrete-action variant: per-step categorical CEM over the 56 actions, TS1 trajectory sampling. Reward is computed analytically from HP primitives — no learned reward head.
+
+```bash
+uv run python scripts/collect_data.py --games 5               # pixels not required
+uv run python -m leworldgaming.training.train_pets --num-steps 1000
+```
+
+Defaults in `configs/pets.yaml`: 5-member ensemble, hidden=200, num_layers=3, batch 256, lr 1e-3. Inference-time CEM planner: horizon=15, 200 candidates, 20 elites, 4 iterations — tune these down (`planner_horizon`, `planner_num_candidates`) if you blow the 16.67 ms frame budget; the agent wraps each `act()` call in `FrameBudget`.
+
+## Train any agent via the dispatcher
+
+```bash
+uv run python scripts/train.py --agent lewm    --steps 1000
+uv run python scripts/train.py --agent dreamer --steps 1000
+uv run python scripts/train.py --agent pets    --steps 1000
+```
+
 ## Smoke tests (no game required)
 
 ```bash
-uv run python scripts/demo_lewm_synthetic.py   # full JEPA stack on random tensors (MPS/CPU)
-uv run python scripts/demo_state_vector.py     # state-vector + replay-buffer round trip
+uv run python scripts/demo_state_vector.py        # primitives dict + new replay schema round-trip
+uv run python scripts/demo_lewm_synthetic.py      # full JEPA stack on random tensors (MPS/CPU)
+uv run python scripts/demo_pets_synthetic.py      # ensemble train + CEM planner end-to-end
+uv run python scripts/demo_dreamer_synthetic.py   # full Dreamer (WM + actor + critic) train step (heavy on CPU/MPS)
 ```
 
 ## Layout

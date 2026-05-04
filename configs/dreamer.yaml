@@ -1,6 +1,26 @@
+# DreamerV3 offline training config. Keys here override
+# train_dreamer.DEFAULTS. Anything not listed inherits from
+# external/dreamerv3-torch/configs.yaml (defaults + dmc_vision).
+
+# Data + I/O
+data_path: data/replay.h5
+episode_dir: data/dreamer_episodes
+ckpt_path: data/dreamer_checkpoint.pt
+logdir: data/dreamer_logs
+image_size: 64
+
+# Optimization
 batch_size: 16
 batch_length: 64
+model_lr: 1.0e-4
+actor_lr: 3.0e-5
+critic_lr: 3.0e-5
 imag_horizon: 15
-lr_world_model: 1.0e-4
-lr_actor: 3.0e-5
-lr_critic: 3.0e-5
+log_every: 10
+seed: 0
+
+# Behaviour modifiers
+compile: false        # torch.compile is flaky on MPS; flip on for CUDA boxes
+precision: 32         # 16 enables AMP — set to 16 on CUDA only
+device: null          # null → auto (CUDA → MPS → CPU)
+actor_dist: onehot    # discrete-action policy head

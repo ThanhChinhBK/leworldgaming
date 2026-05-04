@@ -155,6 +155,8 @@ async def run(args: argparse.Namespace) -> None:
             spectator_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await spectator_task
+        if spectator is not None:
+            spectator.close()
         await gateway.close()
         buffer.close()
 

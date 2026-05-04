@@ -19,7 +19,7 @@ from pyftg.models.screen_data import ScreenData
 
 from leworldgaming.data.replay_buffer import ReplayBuffer
 from leworldgaming.env.policies import Policy
-from leworldgaming.env.state_vector import frame_to_state_vector
+from leworldgaming.env.state_vector import frame_to_obs_dict
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ class RecordingAI(AIInterface):
         action: Action = self._policy(self._frame_data, self._player_number)
 
         if self._record and self._buffer is not None:
-            sv = frame_to_state_vector(
+            obs = frame_to_obs_dict(
                 self._frame_data,
                 self._player_number,
                 max_hp=self._max_hp,
@@ -119,13 +119,11 @@ class RecordingAI(AIInterface):
                 reward = float(damage_dealt - damage_taken) / max(self._max_hp, 1.0)
             pixels = self._pixel_source.latest_pixels() if self._pixel_source else None
             self._buffer.add(
-                state_vector=sv,
+                obs_dict=obs,
                 action=action.to_int(),
                 reward=reward,
                 done=False,
-                hp_self=int(own.hp),
-                hp_opp=int(opp.hp),
-                frame_idx=int(self._frame_data.current_frame_number),
+                is_first=(self._steps_in_episode == 0),
                 pixels=pixels,
             )
             self._prev_hp_self = own.hp

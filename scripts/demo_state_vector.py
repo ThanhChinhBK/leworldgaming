@@ -1,8 +1,10 @@
-"""Offline smoke test for the state vector and replay buffer.
+"""Offline smoke test for the state-vector schema and replay buffer.
 
-Builds a synthetic pyftg FrameData by hand, flattens it to the canonical state
-vector, round-trips a small replay through HDF5, and prints the schema layout
-and a sampled batch. Runs anywhere — does NOT need the game container.
+Builds a synthetic pyftg ``FrameData`` by hand, extracts the canonical
+primitives dict, round-trips a small replay through HDF5 (named-group
+schema with ``is_first`` / ``cont`` flags), then samples both transitions
+and a length-2 sequence batch. Runs anywhere — does NOT need the game
+container.
 
     uv run python scripts/demo_state_vector.py
 """
@@ -21,9 +23,11 @@ from pyftg.models.frame_data import FrameData
 
 from leworldgaming.data.replay_buffer import BufferConfig, ReplayBuffer
 from leworldgaming.env.state_vector import (
-    PER_CHAR_DIM,
+    PETS_STATE_DIM,
     STATE_VECTOR_DIM,
-    frame_to_state_vector,
+    frame_to_obs_dict,
+    obs_dict_to_legacy_vector,
+    obs_dict_to_pets_vector,
 )
 
 
@@ -72,21 +76,30 @@ def make_synthetic_frame(frame_idx: int, hp_self: int, hp_opp: int) -> FrameData
 
 
 def main() -> None:
-    print(f"[demo] STATE_VECTOR_DIM = {STATE_VECTOR_DIM} (per-char {PER_CHAR_DIM} x 2 + 8 global)")
+    print(f"[demo] STATE_VECTOR_DIM (legacy)    = {STATE_VECTOR_DIM}")
+    print(f"[demo] PETS_STATE_DIM (continuous) = {PETS_STATE_DIM}")
     print()
 
-    # 1. flatten one frame and inspect the layout.
+    # 1. Extract primitives dict and inspect both views.
     fd = make_synthetic_frame(frame_idx=42, hp_self=350, hp_opp=200)
-    sv = frame_to_state_vector(fd, player_number=True)
-    print(f"[demo] state_vector dtype={sv.dtype} shape={sv.shape}")
-    print(f"[demo] hp_self_norm={sv[0]:.3f}  hp_opp_norm={sv[PER_CHAR_DIM]:.3f}  "
-          f"hp_diff_norm={sv[PER_CHAR_DIM*2 + 3]:.3f}")
-    print(f"[demo] dx_norm={sv[PER_CHAR_DIM*2]:.3f}  dy_norm={sv[PER_CHAR_DIM*2+1]:.3f}  "
-          f"distance={sv[PER_CHAR_DIM*2+2]:.3f}")
-    assert np.all(np.isfinite(sv))
-    assert sv.dtype == np.float32
+    obs = frame_to_obs_dict(fd, player_number=True)
+    print(f"[demo] obs groups: {sorted(obs.keys())}")
+    print(f"[demo] own.hp={int(obs['own']['hp'])} opp.hp={int(obs['opp']['hp'])} "
+          f"own.x={float(obs['own']['x']):.1f} opp.x={float(obs['opp']['x']):.1f}")
+    print(f"[demo] own.atk_is_live={int(obs['own']['atk_is_live'])} "
+          f"atk_type={int(obs['own']['atk_type'])}")
 
-    # 2. round-trip through HDF5.
+    legacy = obs_dict_to_legacy_vector(obs)
+    pets = obs_dict_to_pets_vector(obs)
+    assert legacy.shape == (STATE_VECTOR_DIM,) and legacy.dtype == np.float32
+    assert pets.shape == (PETS_STATE_DIM,) and pets.dtype == np.float32
+    assert np.all(np.isfinite(legacy))
+    assert np.all(np.isfinite(pets))
+    print(f"[demo] legacy[:8] = {legacy[:8]}")
+    print(f"[demo] pets[:8]   = {pets[:8]}")
+    print()
+
+    # 2. Round-trip an episode through the new HDF5 layout.
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "demo.h5"
         cfg = BufferConfig(path=str(path))
@@ -95,25 +108,29 @@ def main() -> None:
                 fd_t = make_synthetic_frame(
                     frame_idx=t, hp_self=400 - t, hp_opp=400 - 2 * t
                 )
-                sv_t = frame_to_state_vector(fd_t, player_number=True)
+                obs_t = frame_to_obs_dict(fd_t, player_number=True)
                 buf.add(
-                    state_vector=sv_t,
+                    obs_dict=obs_t,
                     action=Action.STAND_A.to_int(),
                     reward=1.0 / 400.0,
                     done=False,
-                    hp_self=400 - t,
-                    hp_opp=400 - 2 * t,
-                    frame_idx=t,
+                    is_first=(t == 0),
                 )
             buf.end_episode()
             print(f"[demo] wrote {len(buf)} transitions across {buf.num_episodes} episode(s)")
 
-        # Re-open and sample.
-        with ReplayBuffer(cfg) as buf:
+        # 3. Re-open in read mode and sample.
+        with ReplayBuffer(BufferConfig(path=str(path), read_only=True)) as buf:
             assert len(buf) == 20
-            batch = buf.sample(batch_size=8, rng=np.random.default_rng(0))
-            print(f"[demo] sampled batch: state_vector={batch['state_vector'].shape}, "
-                  f"action={batch['action'].shape}, reward.mean={batch['reward'].mean():.4f}")
+            tx = buf.sample(batch_size=8, rng=np.random.default_rng(0))
+            print(f"[demo] sampled transitions: action={tx['action'].shape} "
+                  f"reward.mean={tx['reward'].mean():.4f} "
+                  f"is_first.sum={int(tx['is_first'].sum())} "
+                  f"own.hp={tx['own/hp'].mean():.1f}")
+
+            seq = buf.sample_sequences(batch_size=4, seq_len=2, rng=np.random.default_rng(1))
+            print(f"[demo] sampled (B=4, L=2): action={seq['action'].shape} "
+                  f"own/hp={seq['own/hp'].shape} cont={seq['cont'].shape}")
 
     print("[demo] OK")
 

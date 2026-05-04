@@ -104,7 +104,7 @@ def _load_config(path: str | Path | None, overrides: dict[str, Any]) -> dict[str
 
 def _valid_seq_start_indices(f: h5py.File, seq_len: int) -> np.ndarray:
     """Indices ``i`` such that ``[i, i+seq_len-1]`` are all in the same episode and non-terminal."""
-    n = f["state_vector"].shape[0]
+    n = f["action"].shape[0]
     starts = f["episode_starts"][:]
     dones = f["done"][:]
     next_start = np.concatenate([starts[1:], [n]])
@@ -287,7 +287,7 @@ def train(
         train_starts = valid_starts[: n - n_val]
         val_starts = valid_starts[n - n_val :]
         print(
-            f"[train_lewm] frames={f['state_vector'].shape[0]} "
+            f"[train_lewm] frames={f['action'].shape[0]} "
             f"valid_seq_starts={n} train={train_starts.size} val={val_starts.size} "
             f"episodes={f['episode_starts'].shape[0]}"
         )

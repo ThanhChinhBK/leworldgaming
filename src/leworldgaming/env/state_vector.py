@@ -1,10 +1,18 @@
-"""Hand-engineered state vector extracted from pyftg `FrameData`.
+"""Hand-engineered state representation extracted from pyftg `FrameData`.
 
-This is the *primary observation* for state-vector MBRL agents (DreamerV3, PETS,
-TD-MPC2, DC-MPC, etc.). LeWM consumes pixels directly and uses this only as a
-linear-probe target (gemini_research.md §6, §8).
+Two complementary forms:
 
-# Schema (52 features, all float32)
+- ``frame_to_obs_dict(...)`` — the **canonical** form. A nested dict of named
+  primitives in raw physical units (no clipping, no normalization). This is
+  what gets written to the replay buffer; per-method dataloader views in
+  ``leworldgaming.data.views`` materialize whatever shape each trainer needs.
+
+- ``obs_dict_to_legacy_vector(...)`` and ``frame_to_state_vector(...)`` —
+  the **legacy** flat 52-dim float vector kept for back-compat. Used as the
+  LeWM linear-probe target and by older smoke tests. Not stored on disk
+  anymore.
+
+# Schema (legacy 52-feature flat layout)
 
 Per character × 2 (own first, then opponent) = 44 features:
     0   hp / max_hp                       in [0, 1]
@@ -25,19 +33,15 @@ Per character × 2 (own first, then opponent) = 44 features:
     18:22 attack.attack_type one-hot      HIGH, MIDDLE, LOW, THROW
 
 Global / relative (8 features):
-    44  dx = (opp.x - own.x) / STAGE_W    in [-1, 1]
-    45  dy = (opp.y - own.y) / STAGE_H    in [-1, 1]
-    46  distance / DIAG                   in [0, 1]
-    47  hp_diff (own - opp) / max_hp      in [-1, 1]
-    48  round_progress = current_round/3  in [0, 1]
-    49  frame_progress = frame/MAX_FRAMES in [0, 1]
-    50  any_proj_self (0/1)               own has live projectile
-    51  any_proj_opp  (0/1)               opp has live projectile
+    44  dx, 45 dy, 46 distance, 47 hp_diff, 48 round_progress,
+    49  frame_progress, 50 any_proj_self, 51 any_proj_opp
 
 Total: 52 features.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import numpy as np
 
@@ -46,7 +50,7 @@ STAGE_W = 960.0
 STAGE_H = 640.0
 DIAG = float(np.sqrt(STAGE_W**2 + STAGE_H**2))
 
-# Speed clamps — empirical bounds; outliers get clipped.
+# Speed clamps — empirical bounds; outliers get clipped (legacy form only).
 SPEED_X_NORM = 15.0
 SPEED_Y_NORM = 25.0
 
@@ -54,15 +58,28 @@ SPEED_Y_NORM = 25.0
 MAX_FRAMES_PER_ROUND = 3600  # 60 s at 60 FPS
 MAX_ROUNDS = 3
 
-# Frame counts for normalization.
+# Frame counts for normalization (legacy form only).
 REMAINING_FRAME_NORM = 60.0
 ATTACK_FRAME_NORM = 30.0
 HIT_DAMAGE_NORM = 30.0
 
-# Schema dimensions.
+# Schema dimensions (legacy form).
 PER_CHAR_DIM = 22
 GLOBAL_DIM = 8
 STATE_VECTOR_DIM = PER_CHAR_DIM * 2 + GLOBAL_DIM  # 52
+
+# Continuous primitives that PETS / TD-MPC2 / DC-MPC use as flat input.
+# Order is the source of truth for `view_pets` and the analytic cost function.
+PETS_PRIMITIVE_KEYS: tuple[str, ...] = (
+    "hp", "energy", "x", "y", "speed_x", "speed_y",
+    "remaining_frame", "atk_is_live",
+    "atk_start_up", "atk_active", "atk_hit_damage",
+)
+PETS_GLOBAL_KEYS: tuple[str, ...] = (
+    "current_round", "current_frame", "proj_self", "proj_opp",
+)
+# (own + opp) × len(PETS_PRIMITIVE_KEYS) + len(PETS_GLOBAL_KEYS)
+PETS_STATE_DIM = 2 * len(PETS_PRIMITIVE_KEYS) + len(PETS_GLOBAL_KEYS)
 
 
 def _state_to_int(state) -> int:
@@ -71,44 +88,173 @@ def _state_to_int(state) -> int:
     return {"STAND": 0, "CROUCH": 1, "AIR": 2, "DOWN": 3}.get(name, 0)
 
 
-def _encode_character(
-    char,
-    out: np.ndarray,
-    offset: int,
-    max_hp: float,
-    max_energy: float,
-) -> None:
-    """Write 22 features for one character starting at out[offset]."""
+def _empty_char_dict() -> dict[str, Any]:
+    """Neutral defaults for a missing character — STAND, facing right, zeros."""
+    return {
+        "hp": np.int32(0),
+        "energy": np.int32(0),
+        "x": np.float32(0.0),
+        "y": np.float32(0.0),
+        "speed_x": np.float32(0.0),
+        "speed_y": np.float32(0.0),
+        "state": np.int8(0),  # STAND
+        "front": np.int8(1),  # facing right
+        "control": np.int8(0),
+        "remaining_frame": np.int16(0),
+        "hit_confirm": np.int8(0),
+        "atk_is_live": np.int8(0),
+        "atk_start_up": np.int16(0),
+        "atk_active": np.int16(0),
+        "atk_hit_damage": np.int16(0),
+        "atk_type": np.int8(0),
+    }
+
+
+def _encode_character_dict(char) -> dict[str, Any]:
+    """Extract one character's primitives as a flat dict in raw physical units."""
     if char is None:
-        # Defaults preserve neutrality: zeros except state[STAND]=1, front=+1.
-        out[offset + 6] = 1.0  # STAND
-        out[offset + 10] = 1.0  # front
-        return
-
-    out[offset + 0] = char.hp / max(max_hp, 1.0)
-    out[offset + 1] = char.energy / max(max_energy, 1.0)
-    out[offset + 2] = char.x / STAGE_W
-    out[offset + 3] = char.y / STAGE_H
-    out[offset + 4] = np.clip(char.speed_x / SPEED_X_NORM, -1.0, 1.0)
-    out[offset + 5] = np.clip(char.speed_y / SPEED_Y_NORM, -1.0, 1.0)
-
-    state_idx = _state_to_int(char.state)
-    out[offset + 6 + state_idx] = 1.0  # one-hot STAND..DOWN
-
-    out[offset + 10] = 1.0 if char.front else -1.0
-    out[offset + 11] = 1.0 if char.control else 0.0
-    out[offset + 12] = min(char.remaining_frame / REMAINING_FRAME_NORM, 1.0)
-    out[offset + 13] = 1.0 if char.hit_confirm else 0.0
+        return _empty_char_dict()
 
     atk = char.attack_data
-    if atk is not None and getattr(atk, "is_live", False):
+    is_live = bool(getattr(atk, "is_live", False)) if atk is not None else False
+    if is_live:
+        atype = int(getattr(atk, "attack_type", 0))
+        start_up = int(getattr(atk, "start_up", 0))
+        active = int(getattr(atk, "active", 0))
+        hit_damage = int(getattr(atk, "hit_damage", 0))
+    else:
+        atype = 0
+        start_up = 0
+        active = 0
+        hit_damage = 0
+
+    return {
+        "hp": np.int32(char.hp),
+        "energy": np.int32(char.energy),
+        "x": np.float32(char.x),
+        "y": np.float32(char.y),
+        "speed_x": np.float32(char.speed_x),
+        "speed_y": np.float32(char.speed_y),
+        "state": np.int8(_state_to_int(char.state)),
+        "front": np.int8(1 if char.front else -1),
+        "control": np.int8(1 if char.control else 0),
+        "remaining_frame": np.int16(char.remaining_frame),
+        "hit_confirm": np.int8(1 if char.hit_confirm else 0),
+        "atk_is_live": np.int8(1 if is_live else 0),
+        "atk_start_up": np.int16(start_up),
+        "atk_active": np.int16(active),
+        "atk_hit_damage": np.int16(hit_damage),
+        "atk_type": np.int8(atype),
+    }
+
+
+def frame_to_obs_dict(
+    frame_data,
+    player_number: bool,
+    max_hp: float = 400.0,
+    max_energy: float = 300.0,
+) -> dict[str, dict[str, Any]]:
+    """Extract a structured observation from a pyftg `FrameData`.
+
+    Returns a nested dict::
+
+        {
+            "own": {hp, energy, x, y, speed_x, speed_y, state, front, control,
+                    remaining_frame, hit_confirm,
+                    atk_is_live, atk_start_up, atk_active, atk_hit_damage, atk_type},
+            "opp": {... same fields ...},
+            "global": {current_round, current_frame, proj_self, proj_opp,
+                       max_hp, max_energy},
+        }
+
+    All values are NumPy scalars in raw physical units. No clipping, no
+    normalization — that happens at the dataloader view per training method.
+    """
+    own = frame_data.get_character(player_number)
+    opp = frame_data.get_character(not player_number)
+
+    proj_self = 0
+    proj_opp = 0
+    projs = getattr(frame_data, "projectile_data", []) or []
+    for p in projs:
+        if not getattr(p, "is_live", False):
+            continue
+        if p.player_number == player_number:
+            proj_self = 1
+        else:
+            proj_opp = 1
+
+    return {
+        "own": _encode_character_dict(own),
+        "opp": _encode_character_dict(opp),
+        "global": {
+            "current_round": np.int8(max(int(frame_data.current_round), 0)),
+            "current_frame": np.int16(max(int(frame_data.current_frame_number), 0)),
+            "proj_self": np.int8(proj_self),
+            "proj_opp": np.int8(proj_opp),
+            "max_hp": np.int16(int(max_hp)),
+            "max_energy": np.int16(int(max_energy)),
+        },
+    }
+
+
+def _legacy_per_char(c: dict[str, Any], out: np.ndarray, offset: int,
+                     max_hp: float, max_energy: float) -> None:
+    """Encode a 22-dim per-character slice from primitives (legacy form)."""
+    out[offset + 0] = float(c["hp"]) / max(max_hp, 1.0)
+    out[offset + 1] = float(c["energy"]) / max(max_energy, 1.0)
+    out[offset + 2] = float(c["x"]) / STAGE_W
+    out[offset + 3] = float(c["y"]) / STAGE_H
+    out[offset + 4] = float(np.clip(float(c["speed_x"]) / SPEED_X_NORM, -1.0, 1.0))
+    out[offset + 5] = float(np.clip(float(c["speed_y"]) / SPEED_Y_NORM, -1.0, 1.0))
+
+    state_idx = int(c["state"])
+    if 0 <= state_idx <= 3:
+        out[offset + 6 + state_idx] = 1.0  # one-hot STAND..DOWN
+
+    out[offset + 10] = float(c["front"])  # already ±1
+    out[offset + 11] = float(c["control"])
+    out[offset + 12] = min(float(c["remaining_frame"]) / REMAINING_FRAME_NORM, 1.0)
+    out[offset + 13] = float(c["hit_confirm"])
+
+    if int(c["atk_is_live"]) == 1:
         out[offset + 14] = 1.0
-        out[offset + 15] = min(atk.start_up / ATTACK_FRAME_NORM, 1.0)
-        out[offset + 16] = min(atk.active / ATTACK_FRAME_NORM, 1.0)
-        out[offset + 17] = min(atk.hit_damage / HIT_DAMAGE_NORM, 1.0)
-        atype = getattr(atk, "attack_type", 0)
+        out[offset + 15] = min(float(c["atk_start_up"]) / ATTACK_FRAME_NORM, 1.0)
+        out[offset + 16] = min(float(c["atk_active"]) / ATTACK_FRAME_NORM, 1.0)
+        out[offset + 17] = min(float(c["atk_hit_damage"]) / HIT_DAMAGE_NORM, 1.0)
+        atype = int(c["atk_type"])
         if 1 <= atype <= 4:
             out[offset + 17 + atype] = 1.0  # 18..21
+
+
+def obs_dict_to_legacy_vector(obs: dict[str, dict[str, Any]]) -> np.ndarray:
+    """Rebuild the legacy 52-dim float32 vector from a primitives dict.
+
+    Used as the LeWM linear-probe target. Identical numerics to the original
+    ``frame_to_state_vector`` so existing checkpoints / probes stay valid.
+    """
+    out = np.zeros(STATE_VECTOR_DIM, dtype=np.float32)
+    own = obs["own"]
+    opp = obs["opp"]
+    g = obs["global"]
+    max_hp = float(g["max_hp"]) or 400.0
+    max_energy = float(g["max_energy"]) or 300.0
+
+    _legacy_per_char(own, out, 0, max_hp, max_energy)
+    _legacy_per_char(opp, out, PER_CHAR_DIM, max_hp, max_energy)
+
+    gi = PER_CHAR_DIM * 2  # global block start = 44
+    dx = (float(opp["x"]) - float(own["x"])) / STAGE_W
+    dy = (float(opp["y"]) - float(own["y"])) / STAGE_H
+    out[gi + 0] = float(np.clip(dx, -1.0, 1.0))
+    out[gi + 1] = float(np.clip(dy, -1.0, 1.0))
+    out[gi + 2] = float(np.sqrt(dx * dx + dy * dy) * STAGE_W / DIAG)
+    out[gi + 3] = float(np.clip((float(own["hp"]) - float(opp["hp"])) / max_hp, -1.0, 1.0))
+    out[gi + 4] = float(g["current_round"]) / MAX_ROUNDS
+    out[gi + 5] = float(g["current_frame"]) / MAX_FRAMES_PER_ROUND
+    out[gi + 6] = float(g["proj_self"])
+    out[gi + 7] = float(g["proj_opp"])
+    return out
 
 
 def frame_to_state_vector(
@@ -117,47 +263,32 @@ def frame_to_state_vector(
     max_hp: float = 400.0,
     max_energy: float = 300.0,
 ) -> np.ndarray:
-    """Flatten a pyftg `FrameData` into a fixed-shape float32 vector.
+    """Legacy entry point — returns the 52-dim float32 vector directly.
 
-    Args:
-        frame_data: pyftg `FrameData`.
-        player_number: True if "self" is player 1 (index 0), False if player 2.
-        max_hp: HP cap, from `GameData.max_hps[i]` when known.
-        max_energy: energy cap, from `GameData.max_energies[i]` when known.
-
-    Returns:
-        np.ndarray of shape (STATE_VECTOR_DIM,) and dtype float32.
-        All values are finite and bounded in roughly [-1, 1] or [0, 1].
+    Equivalent to ``obs_dict_to_legacy_vector(frame_to_obs_dict(...))``.
     """
-    out = np.zeros(STATE_VECTOR_DIM, dtype=np.float32)
+    obs = frame_to_obs_dict(frame_data, player_number, max_hp=max_hp, max_energy=max_energy)
+    return obs_dict_to_legacy_vector(obs)
 
-    own = frame_data.get_character(player_number)
-    opp = frame_data.get_character(not player_number)
 
-    _encode_character(own, out, 0, max_hp, max_energy)
-    _encode_character(opp, out, PER_CHAR_DIM, max_hp, max_energy)
+def obs_dict_to_pets_vector(obs: dict[str, dict[str, Any]]) -> np.ndarray:
+    """Flat continuous-primitives view for PETS.
 
-    g = PER_CHAR_DIM * 2  # global block start = 44
-    if own is not None and opp is not None:
-        dx = (opp.x - own.x) / STAGE_W
-        dy = (opp.y - own.y) / STAGE_H
-        out[g + 0] = np.clip(dx, -1.0, 1.0)
-        out[g + 1] = np.clip(dy, -1.0, 1.0)
-        out[g + 2] = float(np.sqrt(dx * dx + dy * dy) * STAGE_W / DIAG)
-        out[g + 3] = np.clip((own.hp - opp.hp) / max(max_hp, 1.0), -1.0, 1.0)
+    Layout: [own.PETS_PRIMITIVE_KEYS] + [opp.PETS_PRIMITIVE_KEYS] + [PETS_GLOBAL_KEYS].
+    Raw physical units (HP in points, x/y in pixels, speeds in px/frame, frames as ints).
+    PETS' internal scaler handles normalization.
+    """
+    parts: list[float] = []
+    for side in ("own", "opp"):
+        c = obs[side]
+        for k in PETS_PRIMITIVE_KEYS:
+            parts.append(float(c[k]))
+    g = obs["global"]
+    for k in PETS_GLOBAL_KEYS:
+        parts.append(float(g[k]))
+    return np.asarray(parts, dtype=np.float32)
 
-    out[g + 4] = max(frame_data.current_round, 0) / MAX_ROUNDS
-    out[g + 5] = max(frame_data.current_frame_number, 0) / MAX_FRAMES_PER_ROUND
 
-    # Live projectile flags.
-    projs = getattr(frame_data, "projectile_data", []) or []
-    for p in projs:
-        if not getattr(p, "is_live", False):
-            continue
-        # player_number on AttackData uses the same convention as CharacterData.
-        if p.player_number == player_number:
-            out[g + 6] = 1.0
-        else:
-            out[g + 7] = 1.0
-
-    return out
+# Indices into the PETS flat vector — used by the analytic cost function.
+PETS_OWN_HP_IDX = PETS_PRIMITIVE_KEYS.index("hp")
+PETS_OPP_HP_IDX = len(PETS_PRIMITIVE_KEYS) + PETS_PRIMITIVE_KEYS.index("hp")

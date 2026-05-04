@@ -1,0 +1,34 @@
+# PETS — Probabilistic Ensembles with Trajectory Sampling.
+# Discrete-action variant: action embedding + iterated CEM over per-step
+# Categorical(56). Reward is recomputed analytically from HP primitives.
+
+# Architecture
+state_dim: 26          # = PETS_STATE_DIM (2 * 11 primitives + 4 globals)
+action_dim: 56
+ensemble_size: 5
+hidden: 200
+num_layers: 3
+action_emb_dim: 16
+max_hp: 400.0
+
+# Optimization
+batch_size: 256
+lr: 1.0e-3
+weight_decay: 1.0e-5
+grad_clip: 1.0
+
+# Inference-time CEM planner (used by PETSAgent.act, not by training loop)
+planner_horizon: 15
+planner_num_candidates: 200
+planner_num_elites: 20
+planner_num_iters: 4
+planner_gamma: 0.99
+planner_sample_dynamics: true
+
+# Data + I/O
+data_path: data/replay.h5
+ckpt_path: data/pets_checkpoint.pt
+log_every: 10
+val_split: 0.1
+val_every: 25
+seed: 0

@@ -33,6 +33,7 @@ class LewmAgent(AgentBase):
         latent_dim = int(cfg.get("latent_dim", 256))
         self.latent_dim = latent_dim
         self.history_size = int(cfg.get("history_size", 3))
+        self.image_size = int(cfg.get("encoder_image_size", 224))
         projector_hidden = int(cfg.get("projector_hidden", 2048))
 
         self.encoder = Encoder(
@@ -91,6 +92,23 @@ class LewmAgent(AgentBase):
             self.action_dim,
             history_size=self.history_size,
         )
+
+    @torch.no_grad()
+    def warmup(self, n_iters: int = 2) -> None:
+        """Run dummy ``act()`` calls to JIT-compile MPS/CUDA kernels.
+
+        First-time PyTorch forward passes on a fresh shape can take 1–3 s
+        while the backend compiles kernels — long enough to stall the JVM
+        and look like a frozen game. Call ``warmup()`` once after ``load()``
+        and before ``gateway.run_game()`` to pay that cost up front.
+        """
+        dummy = torch.zeros(
+            (3, self.image_size, self.image_size),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        for _ in range(int(n_iters)):
+            self.act({"pixels": dummy})
 
     def learn(self, batch: dict[str, Any]) -> dict[str, float]:
         raise NotImplementedError(

@@ -1,7 +1,269 @@
-"""DreamerV3 training entrypoint — delegates to vendored `external/dreamerv3-torch`."""
+"""DreamerV3 offline training driver.
+
+Reads the canonical replay HDF5 (named-group schema), exports it to a
+directory of per-episode ``.npz`` files in the format the vendored
+``external/dreamerv3-torch`` trainer expects, then drives that trainer's
+``WorldModel`` + ``ImagBehavior`` purely from the offline dataset (no live
+env, no rollouts). ``act()`` for online play is deferred until the
+``FightingIceEnv`` sync wrapper is built — see plan in
+``docs/gemini_research.md`` §7.1.
+
+Mirrors ``train_lewm.train`` shape: same DEFAULTS-merge-with-YAML-then-overrides
+config pattern, same logger format, same checkpoint layout.
+"""
 
 from __future__ import annotations
 
+import sys
+import time
+from argparse import Namespace
+from pathlib import Path
+from typing import Any
 
-def train(num_steps: int = 10_000) -> None:
-    raise NotImplementedError("Wire to external/dreamerv3-torch trainer during weekend dev")
+import torch
+import yaml
+
+# Importing the agent module first runs its sys.path + gym alias bootstrap.
+from leworldgaming.agents.dreamer.agent import (
+    DreamerAgent,
+    make_action_space,
+    make_obs_space,
+)
+from leworldgaming.data.dreamer_export import export_episodes_to_npz
+from leworldgaming.env.action_space import NUM_ACTIONS
+from leworldgaming.utils.device import best_device
+from leworldgaming.utils.seed import set_seed
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_DREAMER_DIR = _REPO_ROOT / "external" / "dreamerv3-torch"
+
+
+# Keys exposed at our YAML / CLI layer. Anything else inherits from the
+# upstream ``configs.yaml`` ``defaults`` + ``dmc_vision`` sections.
+DEFAULTS: dict[str, Any] = {
+    # Data + I/O
+    "data_path": "data/replay.h5",
+    "episode_dir": "data/dreamer_episodes",
+    "ckpt_path": "data/dreamer_checkpoint.pt",
+    "logdir": "data/dreamer_logs",
+    "image_size": 64,
+    "num_actions": NUM_ACTIONS,
+    # Optimization
+    "batch_size": 16,
+    "batch_length": 64,
+    "model_lr": 1.0e-4,
+    "actor_lr": 3.0e-5,
+    "critic_lr": 3.0e-5,
+    "imag_horizon": 15,
+    "log_every": 10,
+    "val_every": 0,  # offline pretraining doesn't have a held-out env
+    "seed": 0,
+    # Behaviour modifiers
+    "compile": False,  # disable torch.compile by default — flaky on MPS
+    "precision": 32,   # 16 enables AMP; CPU/MPS prefer 32
+    "device": None,    # auto-pick via best_device() if unset
+    "actor_dist": "onehot",  # discrete-action default
+}
+
+
+def _load_config(path: str | Path | None, overrides: dict[str, Any]) -> dict[str, Any]:
+    cfg = dict(DEFAULTS)
+    if path is not None and Path(path).exists():
+        with open(path) as fh:
+            file_cfg = yaml.safe_load(fh) or {}
+        cfg.update({k: v for k, v in file_cfg.items() if k in DEFAULTS})
+    cfg.update({k: v for k, v in overrides.items() if v is not None})
+    return cfg
+
+
+def _build_dreamer_config(cfg: dict[str, Any], device: torch.device) -> Namespace:
+    """Compose the vendored Dreamer's full config from upstream defaults +
+    the dmc_vision section + our overrides. Returns an ``argparse.Namespace``.
+    """
+    import ruamel.yaml as ryaml
+
+    yaml_path = _DREAMER_DIR / "configs.yaml"
+    with open(yaml_path) as fh:
+        configs = ryaml.YAML(typ="safe").load(fh)
+
+    def deep_update(base: dict, upd: dict) -> None:
+        for k, v in upd.items():
+            if isinstance(v, dict) and isinstance(base.get(k), dict):
+                deep_update(base[k], v)
+            else:
+                base[k] = v
+
+    merged: dict[str, Any] = {}
+    deep_update(merged, configs["defaults"])
+    deep_update(merged, configs["dmc_vision"])
+
+    # Discrete-action overrides (mirrors the ``crafter`` config).
+    merged["actor"]["dist"] = cfg["actor_dist"]
+    merged["actor"]["std"] = "none"
+
+    # Our overrides.
+    merged["batch_size"] = int(cfg["batch_size"])
+    merged["batch_length"] = int(cfg["batch_length"])
+    merged["model_lr"] = float(cfg["model_lr"])
+    merged["actor"]["lr"] = float(cfg["actor_lr"])
+    merged["critic"]["lr"] = float(cfg["critic_lr"])
+    merged["imag_horizon"] = int(cfg["imag_horizon"])
+    merged["device"] = str(cfg["device"] or device)
+    merged["compile"] = bool(cfg["compile"])
+    merged["precision"] = int(cfg["precision"])
+    merged["seed"] = int(cfg["seed"])
+    merged["num_actions"] = int(cfg["num_actions"])
+    merged["size"] = [int(cfg["image_size"]), int(cfg["image_size"])]
+    merged["log_every"] = int(cfg["log_every"]) * 1000  # upstream's tools.Every is divisor-based
+    merged["video_pred_log"] = False
+    merged["expl_until"] = 0
+    merged["expl_behavior"] = "greedy"
+    # Offline mode → no env interaction; prevent simulate() paths from triggering.
+    merged["offline_traindir"] = str(Path(cfg["episode_dir"]).resolve())
+    merged["offline_evaldir"] = ""
+
+    # Flatten to Namespace (top-level attributes only — nested dicts stay dicts).
+    return Namespace(**merged)
+
+
+def train(
+    num_steps: int = 1000,
+    config_path: str | Path | None = "configs/dreamer.yaml",
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Run the offline DreamerV3 training loop.
+
+    Steps:
+      1. Convert the HDF5 replay into per-episode npz files (cached).
+      2. Build the upstream Dreamer with our obs_space / act_space.
+      3. Loop ``num_steps`` calls to ``WorldModel._train`` + ``ImagBehavior._train``.
+      4. Save the agent state_dict + config.
+    """
+    cfg = _load_config(config_path, overrides)
+    set_seed(int(cfg["seed"]))
+    device = torch.device(cfg["device"]) if cfg["device"] else best_device()
+    image_size = int(cfg["image_size"])
+    num_actions = int(cfg["num_actions"])
+
+    print(
+        f"[train_dreamer] device={device} steps={num_steps} batch={cfg['batch_size']}x"
+        f"{cfg['batch_length']} image={image_size}x{image_size}"
+    )
+    print(f"[train_dreamer] data={cfg['data_path']} eps={cfg['episode_dir']} "
+          f"ckpt={cfg['ckpt_path']}")
+
+    # 1. Export episodes if needed.
+    if not Path(cfg["data_path"]).exists():
+        raise FileNotFoundError(
+            f"{cfg['data_path']} not found — run scripts/collect_data.py --pixels first"
+        )
+    n_episodes = export_episodes_to_npz(
+        cfg["data_path"], cfg["episode_dir"],
+        image_size=image_size, action_dim=num_actions,
+    )
+    if n_episodes == 0:
+        raise RuntimeError(
+            f"No episodes exported from {cfg['data_path']}. Collect more games first."
+        )
+
+    # 2. Bring up the upstream stack.
+    import dreamer as dreamer_mod  # noqa: E402  — sys.path was extended above
+    import tools as dreamer_tools  # noqa: E402
+
+    obs_space = make_obs_space(image_size)
+    act_space = make_action_space(num_actions)
+
+    dreamer_cfg = _build_dreamer_config(cfg, device)
+
+    logdir = Path(cfg["logdir"])
+    logdir.mkdir(parents=True, exist_ok=True)
+    logger = dreamer_tools.Logger(logdir, step=0)
+
+    train_eps = dreamer_tools.load_episodes(Path(cfg["episode_dir"]))
+    if not train_eps:
+        raise RuntimeError(f"load_episodes() returned empty for {cfg['episode_dir']}")
+    train_dataset = dreamer_mod.make_dataset(train_eps, dreamer_cfg)
+
+    agent_module = dreamer_mod.Dreamer(
+        obs_space, act_space, dreamer_cfg, logger, train_dataset,
+    ).to(device)
+    agent_module.requires_grad_(requires_grad=False)
+
+    n_params = sum(p.numel() for p in agent_module.parameters()) / 1e6
+    print(f"[train_dreamer] params: {n_params:.2f}M, episodes={len(train_eps)}")
+
+    agent = DreamerAgent(agent_module, dreamer_cfg, device)
+
+    # 3. Train.
+    log_every = int(cfg["log_every"])
+    history: list[dict[str, float]] = []
+    t0 = time.time()
+    for step in range(num_steps):
+        batch = next(train_dataset)
+        metrics = agent.learn(batch)
+        metrics["step"] = step
+        history.append(metrics)
+        if step % log_every == 0 or step == num_steps - 1:
+            shown = {k: metrics[k] for k in (
+                "kl", "image_loss", "reward_loss", "cont_loss",
+                "actor_ent", "beh_critic_loss",
+            ) if k in metrics}
+            shown_str = " ".join(f"{k}={v:.4f}" for k, v in shown.items())
+            print(f"[train_dreamer] step={step:5d} {shown_str}")
+
+    elapsed = time.time() - t0
+    print(f"[train_dreamer] done in {elapsed:.1f}s ({num_steps / max(elapsed, 1e-9):.1f} step/s)")
+
+    # 4. Save.
+    ckpt_path = Path(cfg["ckpt_path"])
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "agent_state_dict": agent_module.state_dict(),
+            "config": cfg,
+            "num_steps": num_steps,
+        },
+        ckpt_path,
+    )
+    print(f"[train_dreamer] saved checkpoint -> {ckpt_path}")
+
+    return {
+        "ckpt_path": str(ckpt_path),
+        "final": history[-1] if history else {},
+        "history": history,
+    }
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-steps", type=int, default=1000)
+    parser.add_argument("--config", type=str, default="configs/dreamer.yaml")
+    parser.add_argument("--data-path", type=str, default=None)
+    parser.add_argument("--episode-dir", type=str, default=None)
+    parser.add_argument("--ckpt-path", type=str, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--batch-length", type=int, default=None)
+    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--compile", action="store_true", default=None)
+    args = parser.parse_args()
+
+    overrides = {
+        "data_path": args.data_path,
+        "episode_dir": args.episode_dir,
+        "ckpt_path": args.ckpt_path,
+        "batch_size": args.batch_size,
+        "batch_length": args.batch_length,
+        "image_size": args.image_size,
+        "seed": args.seed,
+        "device": args.device,
+        "compile": args.compile,
+    }
+    train(num_steps=args.num_steps, config_path=args.config, **overrides)
+
+
+if __name__ == "__main__":
+    main()

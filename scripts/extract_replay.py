@@ -49,7 +49,7 @@ def main() -> None:
         raise SystemExit(f"input file not found: {src}")
 
     with h5py.File(src, "r") as f:
-        n_total = f["state_vector"].shape[0]
+        n_total = f["action"].shape[0]
         n_episodes = f["episode_starts"].shape[0]
         episode_starts = f["episode_starts"][:].tolist()
         has_pixels = "pixels" in f and not args.no_pixels
@@ -66,13 +66,13 @@ def main() -> None:
         if args.max is not None:
             indices = indices[: args.max]
 
-        # Per-frame metadata.
+        # Per-frame metadata, read from named-group primitives.
         action_arr = f["action"][:]
         reward_arr = f["reward"][:]
-        hp_self_arr = f["hp_self"][:]
-        hp_opp_arr = f["hp_opp"][:]
-        frame_idx_arr = f["frame_idx"][:]
-        sv_arr = f["state_vector"][:]
+        hp_self_arr = f["obs/own/hp"][:]
+        hp_opp_arr = f["obs/opp/hp"][:]
+        frame_idx_arr = f["obs/global/current_frame"][:]
+        is_first_arr = f["is_first"][:]
 
         # Write CSV.
         csv_path = out / "metadata.csv"
@@ -82,7 +82,7 @@ def main() -> None:
                 "row_idx", "frame_idx", "episode",
                 "action_id", "action_name", "reward",
                 "hp_self", "hp_opp", "hp_diff",
-                "png_path",
+                "is_first", "png_path",
             ])
             for i in indices:
                 ep = sum(1 for s in episode_starts if s <= i) - 1
@@ -97,6 +97,7 @@ def main() -> None:
                     a_id, a_name, f"{float(reward_arr[i]):+.4f}",
                     int(hp_self_arr[i]), int(hp_opp_arr[i]),
                     int(hp_self_arr[i]) - int(hp_opp_arr[i]),
+                    int(is_first_arr[i]),
                     png_rel,
                 ])
         print(f"wrote {csv_path} ({len(indices)} rows)")
@@ -125,8 +126,7 @@ def main() -> None:
             f"min={int(hp_self_arr.min())}\n"
             f"hp_opp:        start={int(hp_opp_arr[0])}, end={int(hp_opp_arr[-1])}, "
             f"min={int(hp_opp_arr.min())}\n"
-            f"state_vec:     shape={sv_arr.shape}, range="
-            f"[{float(sv_arr.min()):.3f}, {float(sv_arr.max()):.3f}]\n"
+            f"is_first sum:  {int(is_first_arr.sum())} (should ≈ #episodes)\n"
             f"exported:      {len(indices)} frames "
             f"(stride={args.stride}, max={args.max})\n"
         )
