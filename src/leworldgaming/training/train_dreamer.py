@@ -31,6 +31,7 @@ from leworldgaming.agents.dreamer.agent import (
 )
 from leworldgaming.data.dreamer_export import export_episodes_to_npz
 from leworldgaming.env.action_space import NUM_ACTIONS
+from leworldgaming.env.state_vector import DREAMER_STATE_DIM
 from leworldgaming.utils.device import best_device
 from leworldgaming.utils.seed import set_seed
 
@@ -39,14 +40,14 @@ _DREAMER_DIR = _REPO_ROOT / "external" / "dreamerv3-torch"
 
 
 # Keys exposed at our YAML / CLI layer. Anything else inherits from the
-# upstream ``configs.yaml`` ``defaults`` + ``dmc_vision`` sections.
+# upstream ``configs.yaml`` ``defaults`` + ``dmc_proprio`` sections.
 DEFAULTS: dict[str, Any] = {
     # Data + I/O
     "data_path": "data/replay.h5",
     "episode_dir": "data/dreamer_episodes",
     "ckpt_path": "data/dreamer_checkpoint.pt",
     "logdir": "data/dreamer_logs",
-    "image_size": 64,
+    "state_dim": DREAMER_STATE_DIM,
     "num_actions": NUM_ACTIONS,
     # Optimization
     "batch_size": 16,
@@ -78,7 +79,13 @@ def _load_config(path: str | Path | None, overrides: dict[str, Any]) -> dict[str
 
 def _build_dreamer_config(cfg: dict[str, Any], device: torch.device) -> Namespace:
     """Compose the vendored Dreamer's full config from upstream defaults +
-    the dmc_vision section + our overrides. Returns an ``argparse.Namespace``.
+    the dmc_proprio section + our overrides. Returns an ``argparse.Namespace``.
+
+    Inheriting from ``dmc_proprio`` (rather than ``dmc_vision``) sets
+    ``encoder.cnn_keys='$^'`` and ``encoder.mlp_keys='.*'`` so the MLP path
+    handles the ``"vector"`` observation we materialize in
+    ``dreamer_export``. The dummy ``"image"`` key is ignored by the
+    encoder regex but satisfies the unconditional preprocess step.
     """
     import ruamel.yaml as ryaml
 
@@ -95,7 +102,7 @@ def _build_dreamer_config(cfg: dict[str, Any], device: torch.device) -> Namespac
 
     merged: dict[str, Any] = {}
     deep_update(merged, configs["defaults"])
-    deep_update(merged, configs["dmc_vision"])
+    deep_update(merged, configs["dmc_proprio"])
 
     # Discrete-action overrides (mirrors the ``crafter`` config).
     merged["actor"]["dist"] = cfg["actor_dist"]
@@ -113,7 +120,6 @@ def _build_dreamer_config(cfg: dict[str, Any], device: torch.device) -> Namespac
     merged["precision"] = int(cfg["precision"])
     merged["seed"] = int(cfg["seed"])
     merged["num_actions"] = int(cfg["num_actions"])
-    merged["size"] = [int(cfg["image_size"]), int(cfg["image_size"])]
     merged["log_every"] = int(cfg["log_every"]) * 1000  # upstream's tools.Every is divisor-based
     merged["video_pred_log"] = False
     merged["expl_until"] = 0
@@ -142,12 +148,12 @@ def train(
     cfg = _load_config(config_path, overrides)
     set_seed(int(cfg["seed"]))
     device = torch.device(cfg["device"]) if cfg["device"] else best_device()
-    image_size = int(cfg["image_size"])
+    state_dim = int(cfg["state_dim"])
     num_actions = int(cfg["num_actions"])
 
     print(
         f"[train_dreamer] device={device} steps={num_steps} batch={cfg['batch_size']}x"
-        f"{cfg['batch_length']} image={image_size}x{image_size}"
+        f"{cfg['batch_length']} state_dim={state_dim}"
     )
     print(f"[train_dreamer] data={cfg['data_path']} eps={cfg['episode_dir']} "
           f"ckpt={cfg['ckpt_path']}")
@@ -155,11 +161,11 @@ def train(
     # 1. Export episodes if needed.
     if not Path(cfg["data_path"]).exists():
         raise FileNotFoundError(
-            f"{cfg['data_path']} not found — run scripts/collect_data.py --pixels first"
+            f"{cfg['data_path']} not found — run scripts/collect_data.py first"
         )
     n_episodes = export_episodes_to_npz(
         cfg["data_path"], cfg["episode_dir"],
-        image_size=image_size, action_dim=num_actions,
+        action_dim=num_actions,
     )
     if n_episodes == 0:
         raise RuntimeError(
@@ -168,9 +174,29 @@ def train(
 
     # 2. Bring up the upstream stack.
     import dreamer as dreamer_mod  # noqa: E402  — sys.path was extended above
+    import networks as dreamer_networks  # noqa: E402
     import tools as dreamer_tools  # noqa: E402
 
-    obs_space = make_obs_space(image_size)
+    # Fix upstream MLP default device. ``MultiEncoder`` constructs its MLP
+    # without passing ``device``, so MLP falls back to its hardcoded
+    # ``device="cuda"`` (networks.py:606) and crashes on non-CUDA hosts at
+    # ``torch.tensor((std,), device=device)`` (line 615). In pixel mode this
+    # was never hit because mlp_keys='$^' skipped MLP construction; proprio
+    # mode hits it on every run. Substitute our actual device for the
+    # "cuda" default; explicit device= calls pass through unchanged.
+    if not getattr(dreamer_networks.MLP, "_lwg_patched", False):
+        _orig_mlp_init = dreamer_networks.MLP.__init__
+        _target_device = str(device)
+
+        def _patched_mlp_init(self, *args, device="cuda", **kwargs):  # noqa: ANN001
+            if device == "cuda" and _target_device != "cuda":
+                device = _target_device
+            return _orig_mlp_init(self, *args, device=device, **kwargs)
+
+        dreamer_networks.MLP.__init__ = _patched_mlp_init
+        dreamer_networks.MLP._lwg_patched = True
+
+    obs_space = make_obs_space(state_dim)
     act_space = make_action_space(num_actions)
 
     dreamer_cfg = _build_dreamer_config(cfg, device)
@@ -245,7 +271,7 @@ def main() -> None:
     parser.add_argument("--ckpt-path", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--batch-length", type=int, default=None)
-    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--state-dim", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--compile", action="store_true", default=None)
@@ -257,7 +283,7 @@ def main() -> None:
         "ckpt_path": args.ckpt_path,
         "batch_size": args.batch_size,
         "batch_length": args.batch_length,
-        "image_size": args.image_size,
+        "state_dim": args.state_dim,
         "seed": args.seed,
         "device": args.device,
         "compile": args.compile,

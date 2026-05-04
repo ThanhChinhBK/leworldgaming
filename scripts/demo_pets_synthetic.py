@@ -18,7 +18,12 @@ import numpy as np
 from leworldgaming.agents.pets.agent import PETSAgent
 from leworldgaming.data.replay_buffer import BufferConfig, ReplayBuffer
 from leworldgaming.env.action_space import NUM_ACTIONS
-from leworldgaming.env.state_vector import PETS_STATE_DIM, frame_to_obs_dict
+from leworldgaming.env.state_vector import (
+    PETS_STATE_DIM,
+    STAGE_W,
+    frame_to_obs_dict,
+    obs_dict_to_pets_vector,
+)
 from leworldgaming.training.train_pets import train
 from leworldgaming.utils.timing import FrameBudget
 from pyftg.models.attack_data import AttackData
@@ -48,8 +53,30 @@ def _make_frame(t: int, hp_self: int, hp_opp: int) -> FrameData:
     )
 
 
+def _mirror_obs(obs: dict) -> dict:
+    """Mirror an obs across the stage x-axis, swapping side roles."""
+    own = dict(obs["own"])
+    opp = dict(obs["opp"])
+    for c in (own, opp):
+        c["x"] = type(c["x"])(STAGE_W - float(c["x"]))
+        c["speed_x"] = type(c["speed_x"])(-float(c["speed_x"]))
+        c["front"] = type(c["front"])(-float(c["front"]))
+    return {"own": own, "opp": opp, "global": dict(obs["global"])}
+
+
 def main() -> None:
     rng = np.random.default_rng(0)
+
+    # Symmetry assertion: training data must be side-invariant after
+    # canonicalize. obs_dict_to_pets_vector(obs) ≡ obs_dict_to_pets_vector(mirror(obs)).
+    fd_left = _make_frame(0, 400, 350)
+    obs_left = frame_to_obs_dict(fd_left, player_number=True)
+    obs_right = _mirror_obs(obs_left)
+    v_left = obs_dict_to_pets_vector(obs_left)
+    v_right = obs_dict_to_pets_vector(obs_right)
+    np.testing.assert_allclose(v_left, v_right, atol=1e-5,
+                               err_msg="PETS state vector is not side-invariant")
+    print("[demo_pets] symmetry: PETS state invariant under side-swap ✓")
 
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "replay.h5"

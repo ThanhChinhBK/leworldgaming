@@ -1,13 +1,13 @@
-# DreamerV3 offline training config. Keys here override
-# train_dreamer.DEFAULTS. Anything not listed inherits from
-# external/dreamerv3-torch/configs.yaml (defaults + dmc_vision).
+# DreamerV3 offline training config — vector / proprio mode.
+# Inherits from external/dreamerv3-torch/configs.yaml (defaults + dmc_proprio);
+# anything listed here overrides DEFAULTS in train_dreamer.py.
 
 # Data + I/O
 data_path: data/replay.h5
 episode_dir: data/dreamer_episodes
 ckpt_path: data/dreamer_checkpoint.pt
 logdir: data/dreamer_logs
-image_size: 64
+state_dim: 42         # = DREAMER_STATE_DIM (own/opp continuous + state/atk one-hots + globals)
 
 # Optimization
 batch_size: 16

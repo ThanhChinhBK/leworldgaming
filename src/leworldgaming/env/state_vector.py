@@ -271,13 +271,85 @@ def frame_to_state_vector(
     return obs_dict_to_legacy_vector(obs)
 
 
-def obs_dict_to_pets_vector(obs: dict[str, dict[str, Any]]) -> np.ndarray:
-    """Flat continuous-primitives view for PETS.
+# --------------------------------------------------------------------------- #
+# Side canonicalization (P1↔P2 symmetry)
+# --------------------------------------------------------------------------- #
+#
+# `obs/own/x`, `speed_x`, `front` are in *stage coordinates*, so a model
+# trained on P1 data (own at left, facing right) wouldn't transfer to P2
+# (own at right, facing left) without seeing the mirrored distribution. We
+# canonicalize to "own always on the left" before flattening so any
+# state-vector method (PETS, vector-mode Dreamer) sees a side-invariant
+# input. Done at view time, not at write time — the buffer keeps raw truth.
 
-    Layout: [own.PETS_PRIMITIVE_KEYS] + [opp.PETS_PRIMITIVE_KEYS] + [PETS_GLOBAL_KEYS].
+_SIDED_X_FIELDS: tuple[str, ...] = ("x",)
+_SIDED_SIGN_FIELDS: tuple[str, ...] = ("speed_x", "front")
+
+
+def _mirror_char_dict(c: dict[str, Any]) -> dict[str, Any]:
+    """Side-flipped copy of a per-character primitives dict."""
+    flipped = dict(c)
+    for k in _SIDED_X_FIELDS:
+        flipped[k] = type(c[k])(STAGE_W - float(c[k]))
+    for k in _SIDED_SIGN_FIELDS:
+        flipped[k] = type(c[k])(-float(c[k]))
+    return flipped
+
+
+def canonicalize_obs_dict(obs: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Mirror the obs along the x-axis when own is on the right of opp.
+
+    Returns a new dict (caller's data is never mutated). When ``own.x <=
+    opp.x`` already, returns the original dict unchanged for cheap pass-through.
+    """
+    if float(obs["own"]["x"]) <= float(obs["opp"]["x"]):
+        return obs
+    return {
+        "own": _mirror_char_dict(obs["own"]),
+        "opp": _mirror_char_dict(obs["opp"]),
+        "global": dict(obs["global"]),  # globals untouched
+    }
+
+
+def canonicalize_sample(sample: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Vectorised canonicalization for ``(B, L, ...)`` arrays from ``sample_window``.
+
+    Returns a new flat dict (only the six side-leaking fields are replaced;
+    other keys are aliased — caller must not mutate them).
+    """
+    own_x = sample["own/x"]
+    opp_x = sample["opp/x"]
+    on_right = own_x > opp_x  # broadcast-friendly mask, shape (B, L)
+
+    out = dict(sample)
+    # Mirror x: x → STAGE_W − x (apply on both sides).
+    for side in ("own", "opp"):
+        key = f"{side}/x"
+        arr = sample[key]
+        out[key] = np.where(on_right, np.float32(STAGE_W) - arr.astype(np.float32), arr)
+    # Mirror signed fields (speed_x, front). dtype preserved via astype below.
+    for side in ("own", "opp"):
+        for field in _SIDED_SIGN_FIELDS:
+            key = f"{side}/{field}"
+            arr = sample[key]
+            mirrored = np.where(on_right, -arr.astype(np.float32), arr.astype(np.float32))
+            out[key] = mirrored.astype(arr.dtype)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Flat-vector views
+# --------------------------------------------------------------------------- #
+
+
+def obs_dict_to_pets_vector(obs: dict[str, dict[str, Any]]) -> np.ndarray:
+    """Flat continuous-primitives view for PETS — side-canonicalized.
+
+    Layout: ``[own.PETS_PRIMITIVE_KEYS] + [opp.PETS_PRIMITIVE_KEYS] + [PETS_GLOBAL_KEYS]``.
     Raw physical units (HP in points, x/y in pixels, speeds in px/frame, frames as ints).
     PETS' internal scaler handles normalization.
     """
+    obs = canonicalize_obs_dict(obs)
     parts: list[float] = []
     for side in ("own", "opp"):
         c = obs[side]
@@ -292,3 +364,51 @@ def obs_dict_to_pets_vector(obs: dict[str, dict[str, Any]]) -> np.ndarray:
 # Indices into the PETS flat vector — used by the analytic cost function.
 PETS_OWN_HP_IDX = PETS_PRIMITIVE_KEYS.index("hp")
 PETS_OPP_HP_IDX = len(PETS_PRIMITIVE_KEYS) + PETS_PRIMITIVE_KEYS.index("hp")
+
+
+# Discrete enum cardinalities. ``state`` ∈ {0..3}, ``atk_type`` ∈ {1..4} when
+# the attack is live (gated separately by ``atk_is_live``).
+STATE_ENUM_DIM = 4   # STAND, CROUCH, AIR, DOWN
+ATK_TYPE_DIM = 4     # HIGH, MIDDLE, LOW, THROW (atk_type 1..4)
+
+# Per-side dimensions in the Dreamer flat vector.
+_DREAMER_PER_CHAR_DIM = len(PETS_PRIMITIVE_KEYS) + STATE_ENUM_DIM + ATK_TYPE_DIM
+DREAMER_STATE_DIM = 2 * _DREAMER_PER_CHAR_DIM + len(PETS_GLOBAL_KEYS)
+
+
+def _one_hot(idx: int, dim: int) -> np.ndarray:
+    out = np.zeros(dim, dtype=np.float32)
+    if 0 <= idx < dim:
+        out[idx] = 1.0
+    return out
+
+
+def obs_dict_to_dreamer_vector(obs: dict[str, dict[str, Any]]) -> np.ndarray:
+    """Flat float32 vector for vector-mode Dreamer (proprio encoder).
+
+    Layout per side (×2)::
+
+        PETS_PRIMITIVE_KEYS continuous (11)
+        state one-hot       (4: STAND, CROUCH, AIR, DOWN)
+        atk_type one-hot    (4: HIGH, MIDDLE, LOW, THROW; all-zero when atk_is_live=0)
+
+    Plus global block (PETS_GLOBAL_KEYS, 4) → ``DREAMER_STATE_DIM`` total.
+    Side-canonicalized internally; symlog squashing happens inside the
+    upstream MLP encoder.
+    """
+    obs = canonicalize_obs_dict(obs)
+    parts: list[np.ndarray] = []
+    for side in ("own", "opp"):
+        c = obs[side]
+        cont = np.asarray([float(c[k]) for k in PETS_PRIMITIVE_KEYS], dtype=np.float32)
+        state_oh = _one_hot(int(c["state"]), STATE_ENUM_DIM)
+        if int(c["atk_is_live"]) == 1 and 1 <= int(c["atk_type"]) <= 4:
+            atk_oh = _one_hot(int(c["atk_type"]) - 1, ATK_TYPE_DIM)
+        else:
+            atk_oh = np.zeros(ATK_TYPE_DIM, dtype=np.float32)
+        parts.extend([cont, state_oh, atk_oh])
+    g = obs["global"]
+    parts.append(
+        np.asarray([float(g[k]) for k in PETS_GLOBAL_KEYS], dtype=np.float32)
+    )
+    return np.concatenate(parts, axis=0)

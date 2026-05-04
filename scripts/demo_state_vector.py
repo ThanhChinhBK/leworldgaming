@@ -23,9 +23,12 @@ from pyftg.models.frame_data import FrameData
 
 from leworldgaming.data.replay_buffer import BufferConfig, ReplayBuffer
 from leworldgaming.env.state_vector import (
+    DREAMER_STATE_DIM,
     PETS_STATE_DIM,
     STATE_VECTOR_DIM,
+    canonicalize_obs_dict,
     frame_to_obs_dict,
+    obs_dict_to_dreamer_vector,
     obs_dict_to_legacy_vector,
     obs_dict_to_pets_vector,
 )
@@ -75,12 +78,30 @@ def make_synthetic_frame(frame_idx: int, hp_self: int, hp_opp: int) -> FrameData
     )
 
 
+def _swap_sides_obs(obs: dict) -> dict:
+    """Return an obs where own is at right (x mirrored across stage), facing left.
+
+    Used to verify that ``canonicalize_obs_dict`` makes the two
+    representations indistinguishable to the model.
+    """
+    from leworldgaming.env.state_vector import STAGE_W
+
+    own = dict(obs["own"])
+    opp = dict(obs["opp"])
+    for c in (own, opp):
+        c["x"] = type(c["x"])(STAGE_W - float(c["x"]))
+        c["speed_x"] = type(c["speed_x"])(-float(c["speed_x"]))
+        c["front"] = type(c["front"])(-float(c["front"]))
+    return {"own": own, "opp": opp, "global": dict(obs["global"])}
+
+
 def main() -> None:
     print(f"[demo] STATE_VECTOR_DIM (legacy)    = {STATE_VECTOR_DIM}")
     print(f"[demo] PETS_STATE_DIM (continuous) = {PETS_STATE_DIM}")
+    print(f"[demo] DREAMER_STATE_DIM           = {DREAMER_STATE_DIM}")
     print()
 
-    # 1. Extract primitives dict and inspect both views.
+    # 1. Extract primitives dict and inspect all views.
     fd = make_synthetic_frame(frame_idx=42, hp_self=350, hp_opp=200)
     obs = frame_to_obs_dict(fd, player_number=True)
     print(f"[demo] obs groups: {sorted(obs.keys())}")
@@ -91,12 +112,32 @@ def main() -> None:
 
     legacy = obs_dict_to_legacy_vector(obs)
     pets = obs_dict_to_pets_vector(obs)
+    dreamer = obs_dict_to_dreamer_vector(obs)
     assert legacy.shape == (STATE_VECTOR_DIM,) and legacy.dtype == np.float32
     assert pets.shape == (PETS_STATE_DIM,) and pets.dtype == np.float32
+    assert dreamer.shape == (DREAMER_STATE_DIM,) and dreamer.dtype == np.float32
     assert np.all(np.isfinite(legacy))
     assert np.all(np.isfinite(pets))
-    print(f"[demo] legacy[:8] = {legacy[:8]}")
-    print(f"[demo] pets[:8]   = {pets[:8]}")
+    assert np.all(np.isfinite(dreamer))
+    print(f"[demo] legacy[:8]  = {legacy[:8]}")
+    print(f"[demo] pets[:8]    = {pets[:8]}")
+    print(f"[demo] dreamer[:8] = {dreamer[:8]}")
+    print()
+
+    # 1b. Side-canonicalization: swapping sides should yield identical
+    # PETS / Dreamer vectors after canonicalize_obs_dict (which is called
+    # internally by both view helpers).
+    swapped = _swap_sides_obs(obs)
+    assert obs["own"]["x"] != swapped["own"]["x"], "test fixture should differ pre-canonicalize"
+    pets_swapped = obs_dict_to_pets_vector(swapped)
+    dreamer_swapped = obs_dict_to_dreamer_vector(swapped)
+    np.testing.assert_allclose(pets, pets_swapped, atol=1e-5, err_msg="PETS not side-invariant")
+    np.testing.assert_allclose(dreamer, dreamer_swapped, atol=1e-5,
+                               err_msg="Dreamer vector not side-invariant")
+    # And canonicalize_obs_dict on a left-side obs is a pass-through.
+    canon_left = canonicalize_obs_dict(obs)
+    assert canon_left is obs, "left-side canonicalize should pass through"
+    print("[demo] side canonicalization: PETS + Dreamer vectors invariant ✓")
     print()
 
     # 2. Round-trip an episode through the new HDF5 layout.

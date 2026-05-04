@@ -60,6 +60,8 @@ pixels (only when --pixels is set; uint8, CHW)
 
 `is_first` flags episode boundaries (Dreamer requires this to reset the RSSM hidden state); `cont` is `1 − done`.
 
+> **`--pixels` is LeWM-only.** Dreamer (proprio mode) and PETS train on the same HDF5 without it. Skip the flag for state-vector-only collection runs to halve disk usage.
+
 ## Inspect data
 
 ```bash
@@ -184,14 +186,18 @@ The AR predictor uses causal self-attention + AdaLN-zero conditioning on per-ste
 
 ## Train DreamerV3 (offline)
 
+DreamerV3 runs in **vector / proprio mode** (per `gemini_research.md` §5) — its RSSM consumes a side-canonicalized 42-d state vector built from the same primitives PETS uses, plus one-hot expansion of the discrete `state` and `atk_type` enums. Pixels are LeWM-only.
+
 The vendored `external/dreamerv3-torch` runs purely from the same HDF5 replay — no live env needed. The trainer exports each episode to a per-episode `.npz` file once (cached in `data/dreamer_episodes/`), then drives `WorldModel._train` + `ImagBehavior._train` directly:
 
 ```bash
-uv run python scripts/collect_data.py --games 5 --pixels      # produce data/replay.h5
+uv run python scripts/collect_data.py --games 5                # produce data/replay.h5
 uv run python -m leworldgaming.training.train_dreamer --num-steps 1000
 ```
 
-Defaults in `configs/dreamer.yaml`: pixels at 64×64 (Dreamer convention; auto-downsampled from collection size), batch 16×64, model_lr 1e-4, actor/critic_lr 3e-5, imag_horizon 15. Online play through `DreamerAgent.act()` is gated on `FightingIceEnv` — for now `act()` raises `NotImplementedError`.
+Defaults in `configs/dreamer.yaml`: 42-d vector observation (`DREAMER_STATE_DIM`), batch 16×64, model_lr 1e-4, actor/critic_lr 3e-5, imag_horizon 15. Inherits the upstream `dmc_proprio` encoder/decoder regex (`mlp_keys='.*'`, `cnn_keys='$^'`). Online play through `DreamerAgent.act()` is gated on `FightingIceEnv` — for now `act()` raises `NotImplementedError`.
+
+**Side symmetry.** State observations are canonicalized at view time so own is always on the left of opp (mirroring x / speed_x / front when needed). A model trained on P1-collected data deploys directly as P2 with no extra changes.
 
 ## Train PETS (state-vector ensemble)
 
@@ -203,6 +209,8 @@ uv run python -m leworldgaming.training.train_pets --num-steps 1000
 ```
 
 Defaults in `configs/pets.yaml`: 5-member ensemble, hidden=200, num_layers=3, batch 256, lr 1e-3. Inference-time CEM planner: horizon=15, 200 candidates, 20 elites, 4 iterations — tune these down (`planner_horizon`, `planner_num_candidates`) if you blow the 16.67 ms frame budget; the agent wraps each `act()` call in `FrameBudget`.
+
+**Side symmetry.** Same canonicalization as Dreamer — `obs_dict_to_pets_vector` mirrors x / speed_x / front when own is on the right. Training and inference both consume the canonical view, so P1-trained PETS deploys directly as P2.
 
 ## Train any agent via the dispatcher
 

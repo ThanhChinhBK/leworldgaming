@@ -46,16 +46,24 @@ def _bootstrap_dreamer_imports() -> Path:
 _DREAMER_DIR = _bootstrap_dreamer_imports()
 
 
-def make_obs_space(image_size: int) -> Any:
-    """Build a ``gymnasium`` Dict obs space matching the vendored encoder.
+def make_obs_space(state_dim: int) -> Any:
+    """Build a ``gymnasium`` Dict obs space matching the vendored proprio encoder.
 
-    The default encoder regex is ``cnn_keys='image'``; we ship a single
-    ``image`` Box so ``MultiEncoder.shapes['image']`` resolves correctly.
+    Vector-mode Dreamer uses ``encoder.cnn_keys='$^'`` and
+    ``encoder.mlp_keys='.*'`` — the MLP path picks up the ``"vector"`` key.
+    A 1×1×3 dummy ``"image"`` exists only because
+    ``WorldModel.preprocess`` at ``external/dreamerv3-torch/models.py:182``
+    unconditionally executes ``obs["image"] = obs["image"] / 255.0``; the
+    encoder regex ensures it's never actually processed.
     """
     import gymnasium as gym
+    import numpy as np
 
     return gym.spaces.Dict({
-        "image": gym.spaces.Box(0, 255, (image_size, image_size, 3), dtype="uint8"),
+        "vector": gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(state_dim,), dtype="float32",
+        ),
+        "image": gym.spaces.Box(0, 255, (1, 1, 3), dtype="uint8"),
     })
 
 
