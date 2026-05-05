@@ -55,10 +55,11 @@ obs/own/{hp,energy,x,y,speed_x,speed_y,state,front,control,
 obs/opp/{...mirrored...}
 obs/global/{current_round,current_frame,proj_self,proj_opp,max_hp,max_energy}
 action  reward  done  is_first  cont  episode_starts
+state_vector (N, 52) float32         — legacy flat mirror; LeWM Stage-B probe target
 pixels (only when --pixels is set; uint8, CHW)
 ```
 
-`is_first` flags episode boundaries (Dreamer requires this to reset the RSSM hidden state); `cont` is `1 − done`.
+`is_first` flags episode boundaries (Dreamer requires this to reset the RSSM hidden state); `cont` is `1 − done`. `state_vector` is the legacy 52-dim flat form (`obs_dict_to_legacy_vector`) — written alongside the named groups so the LeWM Stage-B head trainer's linear probe and any other tool expecting the legacy layout work without re-derivation.
 
 > **`--pixels` is LeWM-only.** Dreamer (proprio mode) and PETS train on the same HDF5 without it. Skip the flag for state-vector-only collection runs to halve disk usage.
 
@@ -69,9 +70,20 @@ uv run python scripts/extract_replay.py --stride 30   # dumps PNGs + metadata.cs
 open data/extracted/frames                            # browse in Finder
 ```
 
-## Train LeWM (end-to-end)
+## Train LeWM (two stages)
 
-The full pipeline: collect pixel data → train the JEPA world model → checkpoint.
+LeWM trains in two stages so the JEPA representation objective stays clean
+and isolated from reward-driven heads:
+
+| Stage | What | Output |
+|---|---|---|
+| **A** — JEPA pretraining | next-embedding prediction + SIGReg, encoder-grounded only | `data/lewm_checkpoint.pt` |
+| **B** — head training | freeze JEPA, fit reward / continuation / value / probe heads on the same replay | `data/lewm_heads_checkpoint.pt` |
+
+Stage A is what the original LeWM paper trains. Stage B is what the
+benchmark plan (see `docs/benchmark_plan.md`) needs so MCTS can score tree
+nodes — without it the latent-space planner has no learned reward / value
+signal.
 
 ### 1. Collect replay data with pixels
 
@@ -184,6 +196,62 @@ ViT-12 encoder (5.57M) → Projector (1.05M) → AR Predictor (14.97M) → pred_
 
 The AR predictor uses causal self-attention + AdaLN-zero conditioning on per-step action embeddings, so one forward pass yields `T` parallel next-step predictions during training.
 
+### 5. Stage B: head training for MCTS planning
+
+After Stage A converges, fit the reward / continuation / value / probe
+heads on the same replay so LeWM exposes the same `(z, a) → z', r̂, ĉ, V̂`
+interface as Dreamer / PETS. JEPA components are frozen; only the heads
+update.
+
+```bash
+uv run python scripts/train.py --agent lewm --stage b --steps 20000
+```
+
+Heads added (each a small MLP on top of the latent `z`):
+
+| Head | Input | Loss | Notes |
+|---|---|---|---|
+| `RewardHead` | `(z, a_emb)` | twohot CE on HP-delta | TD-MPC2 / DreamerV3 discrete-regression bins |
+| `ContinuationHead` | `z` | BCE on `1 - done` | MCTS termination signal |
+| `ValueHead` | `z` | twohot CE on λ-return | bootstrap via EMA target net |
+| `LinearProbe` | `z` | MSE on physical targets | finally trained — used by `planner.py` |
+
+Plus an optional **imagined-rollout consistency** loss: roll the frozen
+predictor forward `imagined_horizon` steps and apply the same reward +
+continuation losses on the predictor-rolled latents `ẑ_{t+k}`. This is
+what makes the heads reliable on the trees MCTS will explore — without
+it, heads only ever see encoder-grounded `z`.
+
+Config knobs (`configs/lewm_heads.yaml`):
+
+| Key | Default | Effect |
+|---|---|---|
+| `reward_loss_weight` | 1.0 | enable / scale reward head |
+| `cont_loss_weight` | 1.0 | enable / scale continuation head |
+| `value_loss_weight` | 0.0 | set > 0 to enable value head + λ-return |
+| `imagined_horizon` | 0 | set > 0 to enable predictor-rolled supervision |
+| `imagined_loss_weight` | 0.0 | scale imagined consistency loss |
+| `probe_loss_weight` | 0.0 | set > 0 to actually train the linear probe |
+
+Defaults disable everything except reward/continuation so the bring-up is
+incremental — start there, add value, then imagined, then probe. The
+benchmark plan recommends turning all four on (`value=0.5`,
+`imagined_horizon=5`, `imagined=1.0`, `probe=0.1`).
+
+#### What to watch during Stage B
+
+```
+step= 100 train r=0.05 c=0.001 v=0.6 r_im=0.06 c_im=0.001 probe=0.4 |z|=27 grad=2.0
+```
+
+- `r` / `r_im` — encoder-grounded vs predictor-rolled reward CE; gap = compounding error in the world model
+- `v` — λ-return CE; should plateau, not collapse to 0 (bootstrap from EMA target keeps it honest)
+- `probe` — MSE on `[hp_diff, hp_self, hp_opp, distance]` extracted from `state_vector`
+
+The Stage-B checkpoint is self-contained: it carries the Stage-A weights
+plus the four heads, so `LewmAgent.load("data/lewm_heads_checkpoint.pt")`
+gives you a fully-headed agent ready for MCTS.
+
 ## Train DreamerV3 (offline)
 
 DreamerV3 runs in **vector / proprio mode** (per `gemini_research.md` §5) — its RSSM consumes a side-canonicalized 42-d state vector built from the same primitives PETS uses, plus one-hot expansion of the discrete `state` and `atk_type` enums. Pixels are LeWM-only.
@@ -215,7 +283,8 @@ Defaults in `configs/pets.yaml`: 5-member ensemble, hidden=200, num_layers=3, ba
 ## Train any agent via the dispatcher
 
 ```bash
-uv run python scripts/train.py --agent lewm    --steps 1000
+uv run python scripts/train.py --agent lewm    --steps 1000              # Stage A (JEPA pretraining)
+uv run python scripts/train.py --agent lewm --stage b --steps 20000      # Stage B (heads on top of Stage A)
 uv run python scripts/train.py --agent dreamer --steps 1000
 uv run python scripts/train.py --agent pets    --steps 1000
 ```

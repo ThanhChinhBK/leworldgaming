@@ -50,6 +50,11 @@ from leworldgaming.agents.lewm.encoder import Encoder
 from leworldgaming.agents.lewm.predictor import Predictor
 from leworldgaming.agents.lewm.projector import Projector
 from leworldgaming.agents.lewm.sigreg import SIGReg
+from leworldgaming.training._replay_utils import (
+    sample_sequence_batch as _sample_sequence_batch,
+    to_device_seq as _to_device_seq,
+    valid_seq_start_indices as _valid_seq_start_indices,
+)
 from leworldgaming.utils.device import amp_autocast, best_device
 from leworldgaming.utils.seed import set_seed
 
@@ -100,67 +105,6 @@ def _load_config(path: str | Path | None, overrides: dict[str, Any]) -> dict[str
         cfg.update({k: v for k, v in file_cfg.items() if k in DEFAULTS})
     cfg.update({k: v for k, v in overrides.items() if v is not None})
     return cfg
-
-
-def _valid_seq_start_indices(f: h5py.File, seq_len: int) -> np.ndarray:
-    """Indices ``i`` such that ``[i, i+seq_len-1]`` are all in the same episode and non-terminal."""
-    n = f["action"].shape[0]
-    starts = f["episode_starts"][:]
-    dones = f["done"][:]
-    next_start = np.concatenate([starts[1:], [n]])
-    # last-of-episode mask
-    is_last = np.zeros(n, dtype=bool)
-    is_last[next_start - 1] = True
-
-    # An index i is a valid start iff every position j in [i, i+seq_len-1]:
-    #   - exists (i + seq_len - 1 < n)
-    #   - is not a `done` flag (no terminal in the middle of the window)
-    #   - is in the same episode (no episode boundary inside the window)
-    candidates = np.arange(n - seq_len + 1)
-    # Vectorise the "no done & same episode" check via a rolling window.
-    valid = np.ones(candidates.size, dtype=bool)
-    for k in range(seq_len):
-        idx = candidates + k
-        valid &= dones[idx] == 0
-        # Skip "is_last" in the middle (positions 0..seq_len-2). Last position
-        # is allowed to be last-of-episode since we don't predict beyond it.
-        if k < seq_len - 1:
-            valid &= ~is_last[idx]
-    return candidates[valid]
-
-
-def _sample_sequence_batch(
-    f: h5py.File,
-    valid_starts: np.ndarray,
-    batch_size: int,
-    seq_len: int,
-    rng: np.random.Generator,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``(pixels, actions)`` shaped ``(B, T, C, H, W)`` and ``(B, T)``."""
-    pick = rng.choice(valid_starts, size=batch_size, replace=valid_starts.size < batch_size)
-    all_idx = (pick[:, None] + np.arange(seq_len)[None, :]).reshape(-1)
-    union = np.unique(all_idx)
-    pixels_block = f["pixels"][union]
-    actions_block = f["action"][union]
-    lookup = {int(v): k for k, v in enumerate(union)}
-    flat_lookup = np.array([lookup[int(i)] for i in all_idx])
-    pixels = pixels_block[flat_lookup].reshape(batch_size, seq_len, *pixels_block.shape[1:])
-    actions = actions_block[flat_lookup].reshape(batch_size, seq_len)
-    return pixels, actions
-
-
-def _to_device_seq(
-    pixels_np: np.ndarray,
-    actions_np: np.ndarray,
-    action_dim: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    pixels = (
-        torch.from_numpy(pixels_np).to(device, dtype=torch.float32).div_(127.5).sub_(1.0)
-    )  # (B, T, C, H, W)
-    actions = torch.from_numpy(actions_np.astype(np.int64)).to(device)  # (B, T)
-    a_oh = nn.functional.one_hot(actions, num_classes=action_dim).float()  # (B, T, A)
-    return pixels, a_oh
 
 
 def train(

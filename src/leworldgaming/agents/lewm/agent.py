@@ -1,18 +1,28 @@
-"""LeWM agent — encoder + projector + AR predictor + pred_proj + action encoder + probe + planner."""
+"""LeWM agent — encoder + projector + AR predictor + pred_proj + action encoder + probe + planner.
+
+After Stage-B head training (``train_lewm_heads.py``) the checkpoint also
+carries reward / continuation / value heads. They are optional at load
+time: if the ckpt has only Stage-A keys the heads stay at random init and
+``act()`` falls back to the legacy random-shooting planner.
+"""
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import torch
 
 from leworldgaming.agents.base import AgentBase
 from leworldgaming.agents.lewm.action_encoder import ActionEncoder
+from leworldgaming.agents.lewm.continuation_head import ContinuationHead
 from leworldgaming.agents.lewm.encoder import Encoder
 from leworldgaming.agents.lewm.planner import random_shooting
 from leworldgaming.agents.lewm.predictor import Predictor
 from leworldgaming.agents.lewm.probe import LinearProbe
 from leworldgaming.agents.lewm.projector import Projector
+from leworldgaming.agents.lewm.reward_head import RewardHead
+from leworldgaming.agents.lewm.value_head import ValueHead
 
 
 class LewmAgent(AgentBase):
@@ -35,6 +45,8 @@ class LewmAgent(AgentBase):
         self.history_size = int(cfg.get("history_size", 3))
         self.image_size = int(cfg.get("encoder_image_size", 224))
         projector_hidden = int(cfg.get("projector_hidden", 2048))
+        self.heads_cfg: dict[str, Any] = dict(cfg.get("heads", {}))
+        self.heads_loaded = False  # set True only after Stage-B weights load.
 
         self.encoder = Encoder(
             latent_dim=latent_dim,
@@ -65,7 +77,23 @@ class LewmAgent(AgentBase):
         self.pred_proj = Projector(latent_dim=latent_dim, hidden_dim=projector_hidden).to(
             self.device
         )
-        self.probe = LinearProbe(latent_dim=latent_dim).to(self.device)
+        probe_targets = self.heads_cfg.get("probe_targets", [47, 0, 22, 46])
+        self.probe = LinearProbe(latent_dim=latent_dim, target_dim=len(probe_targets)).to(
+            self.device
+        )
+
+        head_hidden = int(self.heads_cfg.get("hidden_dim", 512))
+        reward_bins = int(self.heads_cfg.get("reward_bins", 41))
+        value_bins = int(self.heads_cfg.get("value_bins", 41))
+        self.reward_head = RewardHead(
+            latent_dim=latent_dim, hidden_dim=head_hidden, num_bins=reward_bins
+        ).to(self.device)
+        self.continuation_head = ContinuationHead(
+            latent_dim=latent_dim, hidden_dim=head_hidden
+        ).to(self.device)
+        self.value_head = ValueHead(
+            latent_dim=latent_dim, hidden_dim=head_hidden, num_bins=value_bins
+        ).to(self.device)
         self._set_eval()
 
     def _set_eval(self) -> None:
@@ -76,6 +104,9 @@ class LewmAgent(AgentBase):
             self.predictor,
             self.pred_proj,
             self.probe,
+            self.reward_head,
+            self.continuation_head,
+            self.value_head,
         ):
             m.eval()
 
@@ -116,21 +147,28 @@ class LewmAgent(AgentBase):
         )
 
     def save(self, path: str) -> None:
-        torch.save(
-            {
-                "encoder": self.encoder.state_dict(),
-                "projector": self.projector.state_dict(),
-                "action_encoder": self.action_encoder.state_dict(),
-                "predictor": self.predictor.state_dict(),
-                "pred_proj": self.pred_proj.state_dict(),
-                "probe": self.probe.state_dict(),
-            },
-            path,
-        )
+        save_dict = {
+            "encoder": self.encoder.state_dict(),
+            "projector": self.projector.state_dict(),
+            "action_encoder": self.action_encoder.state_dict(),
+            "predictor": self.predictor.state_dict(),
+            "pred_proj": self.pred_proj.state_dict(),
+            "probe": self.probe.state_dict(),
+            "reward_head": self.reward_head.state_dict(),
+            "continuation_head": self.continuation_head.state_dict(),
+            "value_head": self.value_head.state_dict(),
+            "heads_config": self.heads_cfg,
+        }
+        torch.save(save_dict, path)
 
     def load(self, path: str) -> None:
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         cfg = ckpt.get("config")
+        # Stage-B checkpoints carry heads_config; fold it into cfg so
+        # _build_modules sizes the heads correctly before loading weights.
+        if cfg is not None and "heads_config" in ckpt:
+            cfg = dict(cfg)
+            cfg["heads"] = ckpt["heads_config"]
         if cfg:
             self._build_modules(cfg)
         self.encoder.load_state_dict(ckpt["encoder"])
@@ -141,6 +179,21 @@ class LewmAgent(AgentBase):
         self.predictor.load_state_dict(ckpt["predictor"])
         if "pred_proj" in ckpt:
             self.pred_proj.load_state_dict(ckpt["pred_proj"])
+
+        stage_b_keys = ("reward_head", "continuation_head", "value_head")
+        has_stage_b = all(k in ckpt for k in stage_b_keys)
         if "probe" in ckpt:
             self.probe.load_state_dict(ckpt["probe"])
+        if has_stage_b:
+            self.reward_head.load_state_dict(ckpt["reward_head"])
+            self.continuation_head.load_state_dict(ckpt["continuation_head"])
+            self.value_head.load_state_dict(ckpt["value_head"])
+            self.heads_loaded = True
+        else:
+            warnings.warn(
+                "LewmAgent.load: Stage-B heads (reward/continuation/value) not found in "
+                f"{path}; reward/value heads are at random init. MCTS planning will not "
+                "work — train Stage B via train_lewm_heads.py.",
+                stacklevel=2,
+            )
         self._set_eval()

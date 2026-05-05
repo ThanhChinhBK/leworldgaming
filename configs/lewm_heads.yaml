@@ -1,0 +1,36 @@
+# Stage-B head trainer config. Architecture is loaded from the input
+# checkpoint's stored config; this file only contains head-specific
+# hyperparameters and I/O paths.
+
+heads:
+  reward_bins: 41
+  reward_low: -1.0
+  reward_high: 1.0
+  value_bins: 41
+  value_low: -10.0
+  value_high: 10.0
+  hidden_dim: 512
+  imagined_horizon: 0     # M2: encoder-grounded only. M4 will bump this to 5.
+  lambda_return: 0.95
+  gamma: 0.997
+  target_ema: 0.99
+  reward_loss_weight: 1.0
+  cont_loss_weight: 1.0
+  value_loss_weight: 0.0  # M2: disabled. M3 will set to 0.5.
+  imagined_loss_weight: 0.0  # M2: disabled.
+  probe_loss_weight: 0.0  # M2: disabled. M5 will enable.
+
+# Optimization (separate from Stage-A optimizer)
+batch_size: 16
+lr: 3.0e-4
+weight_decay: 1.0e-3
+grad_clip: 1.0
+
+# I/O
+data_path: data/replay.h5
+ckpt_in: data/lewm_checkpoint.pt
+ckpt_out: data/lewm_heads_checkpoint.pt
+log_every: 10
+val_split: 0.1
+val_every: 25
+seed: 0
