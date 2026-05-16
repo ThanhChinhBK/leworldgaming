@@ -24,6 +24,8 @@ dependencies = [
     # Vendored dreamerv3-torch deps
     "ruamel.yaml>=0.18",
     "gymnasium>=0.29",
+    # Image processing (fast pixel decode for data collection)
+    "opencv-python-headless>=4.8",
     # Logging
     "tensorboard>=2.16",
     "rich>=13.7",

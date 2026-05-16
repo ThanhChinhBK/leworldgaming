@@ -19,10 +19,15 @@ import asyncio
 import contextlib
 import logging
 import signal
+import time
 from pathlib import Path
 
+from pyftg.models.enums.status_code import StatusCode
+from pyftg.protoc import service_pb2
+from pyftg.socket.aio.ai_controller import AIController
 from pyftg.socket.aio.gateway import Gateway
 from pyftg.socket.aio.stream_controller import StreamController
+from pyftg.socket.utils.asyncio import recv_data, send_data
 
 from leworldgaming.data.replay_buffer import BufferConfig, ReplayBuffer
 from leworldgaming.env.policies import make_policy
@@ -38,7 +43,7 @@ JVM_AIS = {"mctsai23i", "mctsaizoning"}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--games", type=int, default=1, help="Number of games to play")
+    parser.add_argument("--games", type=int, default=180, help="Number of games to play")
     parser.add_argument("--character", type=str, default="ZEN")
     parser.add_argument("--policy-p1", type=str, default="random",
                         help="P1 policy: 'random', 'noop', or a JVM AI class name "
@@ -50,7 +55,8 @@ def parse_args() -> argparse.Namespace:
                              "(MctsAi23i, MctsAiZoning)")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=31415)
-    parser.add_argument("--out", type=str, default="data/replay.h5")
+    parser.add_argument("--out", type=str,
+                        default="/media/jeovach/New Volume/leworldgaming/replay.h5")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-record-p2", action="store_true",
                         help="Only record P1 (halves storage when P1=P2 self-play)")
@@ -66,6 +72,15 @@ def parse_args() -> argparse.Namespace:
 
 async def run(args: argparse.Namespace) -> None:
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+
+    logging.info("=" * 60)
+    logging.info("Data collection — %d games", args.games)
+    logging.info("  output : %s", args.out)
+    logging.info("  P1=%s  P2=%s  char=%s", args.policy_p1, args.policy_p2, args.character)
+    logging.info("  pixels=%s  host=%s:%d", args.pixels, args.host, args.port)
+    logging.info("=" * 60)
+
+    t_start = time.monotonic()
 
     pixel_shape = (3, args.image_size, args.image_size) if args.pixels else None
     cfg = BufferConfig(path=args.out, pixel_shape=pixel_shape)
@@ -98,6 +113,7 @@ async def run(args: argparse.Namespace) -> None:
             buffer=buffer,
             record=True,
             pixel_source=spectator,
+            total_games=args.games,
         )
         gateway.register_ai("LWG_P1", p1)
         agent_names.append("LWG_P1")
@@ -111,46 +127,78 @@ async def run(args: argparse.Namespace) -> None:
             buffer=buffer,
             record=not args.no_record_p2,
             pixel_source=spectator,
+            total_games=args.games,
         )
         gateway.register_ai("LWG_P2", p2)
         agent_names.append("LWG_P2")
 
     logging.info("agents: P1=%s  P2=%s", agent_names[0], agent_names[1])
 
-    game_task = asyncio.create_task(
-        gateway.run_game(
-            characters=[args.character, args.character],
-            agents=agent_names,
-            game_number=args.games,
-        )
+    # --- Send RunGameRequest on a control connection ---
+    reader, writer = await asyncio.open_connection(args.host, args.port)
+    request = service_pb2.RunGameRequest(
+        character_1=args.character, character_2=args.character,
+        player_1=agent_names[0], player_2=agent_names[1],
+        game_number=args.games,
     )
+    await send_data(writer, b"\x02", with_header=False)
+    await send_data(writer, request.SerializeToString())
+    response_packet = await recv_data(reader)
+    response = service_pb2.RunGameResponse()
+    response.ParseFromString(response_packet)
+    if response.status_code is StatusCode.FAILED:
+        raise SystemExit(f"JVM refused game: {response.response_message}")
+    logging.info("game accepted by server")
+
+    # --- Start AI controller tasks (separate connections) ---
+    ai_tasks: list[asyncio.Task] = []
+    for i, name in enumerate(agent_names):
+        agent = gateway.registered_agents.get(name)
+        if agent is not None:
+            ctrl_ai = AIController(args.host, args.port, agent, i == 0)
+            ai_tasks.append(asyncio.create_task(ctrl_ai.run()))
 
     # FightingICE 7.x only ships pixels through the spectator path.
     if spectator is not None:
         ctrl = StreamController(args.host, args.port, spectator, keep_alive=False)
         spectator_task = asyncio.create_task(ctrl.run())
 
-    # SIGINT/SIGTERM cancel run_game so the `finally` flush runs.
+    # SIGINT/SIGTERM cancel AI tasks so the `finally` flush runs.
     loop = asyncio.get_running_loop()
 
     def _cancel() -> None:
-        if not game_task.done():
-            logging.info("signal received, cancelling run_game")
-            game_task.cancel()
+        for t in ai_tasks:
+            if not t.done():
+                t.cancel()
+        logging.info("signal received, cancelling AI tasks")
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _cancel)
 
+    # Wait for AI controllers to finish (they exit on game_end from JVM).
+    # The control connection may close early in render mode — ignore it.
     try:
         timeout = max(args.timeout, args.games * 120)
-        try:
-            await asyncio.wait_for(game_task, timeout=timeout)
-        except TimeoutError:
+        done, pending = await asyncio.wait(
+            ai_tasks, timeout=timeout, return_when=asyncio.ALL_COMPLETED,
+        )
+        for t in pending:
+            logging.warning("AI task timed out — cancelling")
+            t.cancel()
+        # Re-raise any real errors (not IncompleteReadError from socket close).
+        for t in done:
+            exc = t.exception()
+            if exc is not None and not isinstance(exc, asyncio.IncompleteReadError):
+                raise exc
+        if pending:
             logging.warning("game timeout (%ds) exceeded — closing", timeout)
-            game_task.cancel()
-        except asyncio.CancelledError:
-            logging.info("game cancelled")
+    except asyncio.CancelledError:
+        logging.info("game cancelled")
     finally:
+        # Close control connection (may already be closed by JVM).
+        with contextlib.suppress(Exception):
+            writer.close()
+            await writer.wait_closed()
         if spectator_task is not None and not spectator_task.done():
             spectator_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -162,10 +210,14 @@ async def run(args: argparse.Namespace) -> None:
 
     if spectator is not None:
         logging.info("spectator captured %d screen frames", spectator.frames_seen)
+    elapsed = time.monotonic() - t_start
+    mins, secs = divmod(int(elapsed), 60)
     logging.info(
-        "Collected %d transitions across %d episodes -> %s",
+        "Done — %d transitions, %d episodes in %dm%02ds -> %s",
         len(buffer),
         buffer.num_episodes,
+        mins,
+        secs,
         args.out,
     )
 

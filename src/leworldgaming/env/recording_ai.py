@@ -4,6 +4,7 @@ and writes every (state_vector, action, reward, hp) to a `ReplayBuffer`."""
 from __future__ import annotations
 
 import logging
+import time
 from typing import Protocol
 
 import numpy as np
@@ -38,12 +39,14 @@ class RecordingAI(AIInterface):
         buffer: ReplayBuffer | None = None,
         record: bool = True,
         pixel_source: PixelSource | None = None,
+        total_games: int = 1,
     ) -> None:
         self._name = name
         self._policy = policy
         self._buffer = buffer
         self._record = record and (buffer is not None)
         self._pixel_source = pixel_source
+        self._total_games = total_games
         self._cc = CommandCenter()
         self._key = Key()
         self._frame_data = FrameData()
@@ -53,6 +56,10 @@ class RecordingAI(AIInterface):
         self._prev_hp_self: int | None = None
         self._prev_hp_opp: int | None = None
         self._steps_in_episode = 0
+        self._game_index = 0
+        self._round_index = 0
+        self._t_start: float | None = None
+        self._t_game_start: float = 0.0
 
     def name(self) -> str:
         return self._name
@@ -70,6 +77,12 @@ class RecordingAI(AIInterface):
         self._max_energy = (
             float(game_data.max_energies[idx]) if game_data.max_energies else 300.0
         )
+        now = time.monotonic()
+        if self._t_start is None:
+            self._t_start = now
+        self._t_game_start = now
+        if hasattr(self._policy, "on_game_start"):
+            self._policy.on_game_start()  # type: ignore[union-attr]
         logger.info(
             "[%s] initialized as P%d (max_hp=%.0f max_energy=%.0f)",
             self._name,
@@ -141,13 +154,40 @@ class RecordingAI(AIInterface):
     def round_end(self, round_result: RoundResult) -> None:
         if self._record and self._buffer is not None and self._steps_in_episode > 0:
             self._buffer.end_episode()
+        self._round_index += 1
+        steps = self._steps_in_episode
         self._prev_hp_self = None
         self._prev_hp_opp = None
         self._steps_in_episode = 0
-        logger.info("[%s] round end", self._name)
+        buf_len = len(self._buffer) if self._buffer else 0
+        buf_eps = self._buffer.num_episodes if self._buffer else 0
+        logger.info(
+            "[%s] round %d end  |  %d steps this round  |  buffer: %d transitions, %d episodes",
+            self._name, self._round_index, steps, buf_len, buf_eps,
+        )
 
     def game_end(self) -> None:
-        logger.info("[%s] game end", self._name)
+        self._game_index += 1
+        self._round_index = 0
+        now = time.monotonic()
+        game_secs = now - self._t_game_start
+        self._t_game_start = now
+
+        buf_len = len(self._buffer) if self._buffer else 0
+        buf_eps = self._buffer.num_episodes if self._buffer else 0
+
+        elapsed = now - (self._t_start or now)
+        games_per_min = self._game_index / max(elapsed, 1) * 60
+        remaining = self._total_games - self._game_index
+        eta_secs = int(remaining / max(games_per_min, 0.01) * 60)
+        eta_m, eta_s = divmod(eta_secs, 60)
+
+        logger.info(
+            "[%s] game %d/%d complete (%.1fs)  |  %.1f games/min  ETA %dm%02ds"
+            "  |  buffer: %d transitions, %d episodes",
+            self._name, self._game_index, self._total_games, game_secs,
+            games_per_min, eta_m, eta_s, buf_len, buf_eps,
+        )
 
     def close(self) -> None:
         pass
