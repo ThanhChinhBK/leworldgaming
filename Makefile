@@ -1,4 +1,4 @@
-.PHONY: sync demo fmt lint game game-watch game-pixels game-stop fetch-native game-native game-play clean
+.PHONY: sync demo fmt lint game game-watch game-pixels game-stop fetch-native game-native game-native-linux game-play clean
 
 sync:
 	uv sync --extra dev
@@ -40,6 +40,16 @@ game-native: fetch-native
 	@echo "Ctrl-C here to stop."
 	cd vendor/fightingice && java -XstartOnFirstThread \
 		-cp 'FightingICE.jar:./lib/*:./lib/lwjgl/*:./lib/lwjgl/natives/macos/arm64/*:./lib/grpc/*' \
+		Main --limithp 400 400 --grey-bg --pyftg-mode --input-sync
+
+# Native Linux: GPU-accelerated rendering, much faster than Docker+Xvfb.
+# Prereq: sudo apt install openjdk-17-jdk
+game-native-linux: fetch-native
+	@echo "Starting DareFightingICE in pyftg mode (Linux native)…"
+	@echo "Run collector in another terminal:  uv run python scripts/collect_data.py --pixels"
+	@echo "Ctrl-C here to stop."
+	cd vendor/fightingice && java \
+		-cp 'FightingICE.jar:./lib/*:./lib/lwjgl/*:./lib/lwjgl/natives/linux/amd64/*:./lib/grpc/*' \
 		Main --limithp 400 400 --grey-bg --pyftg-mode --input-sync
 
 # Human-play mode: launches the game's own menu — pick "Keyboard" for one or

@@ -41,8 +41,8 @@ services:
       - "400"
       - "--pyftg-mode"
       - "--input-sync"
-      - "--inverted-player"
       - "1"
+      - "--grey-bg"
     deploy:
       resources:
         limits:

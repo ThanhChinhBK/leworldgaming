@@ -25,11 +25,19 @@ make game-native      # AI vs AI mode (for collection)
 make game-play        # human keyboard play
 ```
 
-**On Linux training box (docker):**
+**On Linux training box (native — fastest for pixel collection):**
+
+```bash
+sudo apt install openjdk-21-jdk
+make fetch-native           # one-time download
+make game-native-linux      # GPU-accelerated rendering, ~10× faster than Docker
+```
+
+**On Linux training box (docker — alternative):**
 
 ```bash
 make game             # MODE=fast (no rendering)
-make game-pixels      # MODE=pixels (LeWM data)
+make game-pixels      # MODE=pixels (LeWM data, slower — software rendering via Xvfb)
 make game-watch       # MODE=watch (VNC at vnc://localhost:5900, password: watch)
 make game-stop
 ```
@@ -46,7 +54,39 @@ uv run python scripts/collect_data.py --games 1 --pixels                   # + 2
 uv run python scripts/collect_data.py --games 1 --pixels --image-size 84   # smaller pixels (faster on Mac)
 ```
 
-Output: `data/replay.h5` with raw primitives stored in named groups so a single collection feeds all three trainers (LeWM / Dreamer / PETS) via per-method dataloader views in `src/leworldgaming/data/views.py`:
+Default output: `/media/jeovach/New Volume/leworldgaming/replay.h5` (override with `--out`).
+
+### Large-scale pixel collection (200 games, diverse policies)
+
+Start the game with `make game-native-linux`, then run batches:
+
+```bash
+export DATA_DIR="/media/jeovach/New Volume/leworldgaming"
+
+uv run python scripts/collect_data.py --games 20 --policy-p1 random --policy-p2 random --seed 1 --pixels --out "$DATA_DIR/01_random_v_random.h5"
+uv run python scripts/collect_data.py --games 20 --policy-p1 aggressive --policy-p2 random --seed 2 --pixels --out "$DATA_DIR/02_aggressive_v_random.h5"
+uv run python scripts/collect_data.py --games 20 --policy-p1 defensive --policy-p2 random --seed 3 --pixels --out "$DATA_DIR/03_defensive_v_random.h5"
+uv run python scripts/collect_data.py --games 20 --policy-p1 mixed --policy-p2 random --seed 4 --pixels --out "$DATA_DIR/04_mixed_v_random.h5"
+uv run python scripts/collect_data.py --games 20 --policy-p1 random --policy-p2 aggressive --seed 5 --pixels --out "$DATA_DIR/05_random_v_aggressive.h5"
+uv run python scripts/collect_data.py --games 20 --policy-p1 aggressive --policy-p2 defensive --seed 6 --pixels --out "$DATA_DIR/06_aggressive_v_defensive.h5"
+uv run python scripts/collect_data.py --games 20 --policy-p1 random --policy-p2 MctsAi23i --seed 7 --pixels --out "$DATA_DIR/07_random_v_mcts23i.h5"
+uv run python scripts/collect_data.py --games 20 --policy-p1 aggressive --policy-p2 MctsAi23i --seed 8 --pixels --out "$DATA_DIR/08_aggressive_v_mcts23i.h5"
+uv run python scripts/collect_data.py --games 20 --policy-p1 mixed --policy-p2 MctsAiZoning --seed 9 --pixels --out "$DATA_DIR/09_mixed_v_mctszoning.h5"
+uv run python scripts/collect_data.py --games 20 --policy-p1 defensive --policy-p2 MctsAiZoning --seed 10 --pixels --out "$DATA_DIR/10_defensive_v_mctszoning.h5"
+```
+
+Restart the game engine between batches: `make game-stop && make game-native-linux`.
+
+### Compress after collection
+
+Pixel data is written uncompressed for speed during collection (~32GB per batch). Compress afterwards to save disk:
+
+```bash
+uv run python scripts/compress_replay.py --all    # compress all .h5 in DATA_DIR (3-5× reduction)
+uv run python scripts/compress_replay.py "$DATA_DIR/01_random_v_random.h5"   # single file
+```
+
+Output: HDF5 files with raw primitives stored in named groups so a single collection feeds all three trainers (LeWM / Dreamer / PETS) via per-method dataloader views in `src/leworldgaming/data/views.py`:
 
 ```
 obs/own/{hp,energy,x,y,speed_x,speed_y,state,front,control,
@@ -104,6 +144,9 @@ uv run python scripts/collect_data.py --games 5 --pixels   # terminal 2
 | Value | What it is | Where it runs |
 |---|---|---|
 | `random` | Uniform over the 40 playable actions, sticky for 8 frames (see `env/policies.py`) | Python (pyftg client) |
+| `aggressive` | 80% attacks, 20% movement/guard | Python (pyftg client) |
+| `defensive` | 70% guard/movement, 30% attacks | Python (pyftg client) |
+| `mixed` | Cycles random→aggressive→defensive each game (broadest coverage) | Python (pyftg client) |
 | `noop` (alias `neutral`) | Always `Action.NEUTRAL` — passive baseline | Python (pyftg client) |
 | `MctsAi23i` | Iteration-capped MCTS, the canonical DareFightingICE 7.x training opponent | JVM (loaded server-side from `vendor/fightingice/data/ai/MctsAi23i.jar`) |
 | `MctsAiZoning` | MCTS variant with zoning heuristics | JVM (`MctsAiZoning.jar`) |
@@ -118,8 +161,11 @@ When a JVM AI name is passed, `collect_data.py` does **not** spin up a Python ag
 # Random P1 vs the canonical MCTS opponent (BlindAI-paper recipe)
 uv run python scripts/collect_data.py --games 30 --pixels --policy-p2 MctsAi23i
 
-# Random P1 vs MCTS-with-zoning (different distribution of states)
-uv run python scripts/collect_data.py --games 30 --pixels --policy-p2 MctsAiZoning
+# Mixed policy (cycles strategies each game) vs MCTS zoning
+uv run python scripts/collect_data.py --games 30 --pixels --policy-p1 mixed --policy-p2 MctsAiZoning
+
+# Aggressive vs defensive (varied combat dynamics)
+uv run python scripts/collect_data.py --games 30 --pixels --policy-p1 aggressive --policy-p2 defensive
 
 # Self-play random (maximum entropy, no JVM AI involved)
 uv run python scripts/collect_data.py --games 30 --pixels

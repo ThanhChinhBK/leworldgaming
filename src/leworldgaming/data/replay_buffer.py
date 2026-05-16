@@ -251,15 +251,16 @@ class ReplayBuffer:
         )
         if self.cfg.pixel_shape is not None:
             c, h, w = self.cfg.pixel_shape
-            # Pixels are MB-scale per row; cap the chunk count to keep writes cheap.
-            pixel_chunk = max(1, min(chunk, 256))
+            # No compression for pixels — LZF adds ~78ms/frame latency which
+            # bottlenecks the entire --input-sync pipeline. Raw writes are
+            # 0.2ms/frame. Storage cost: ~150KB/frame ≈ 540MB/round on disk.
+            pixel_chunk = max(1, min(chunk, 64))
             self._f.create_dataset(
                 "pixels",
                 shape=(0, c, h, w),
                 maxshape=(None, c, h, w),
                 chunks=(pixel_chunk, c, h, w),
                 dtype="uint8",
-                compression="lzf",
             )
 
     def close(self) -> None:
