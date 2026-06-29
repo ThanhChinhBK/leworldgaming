@@ -57,19 +57,32 @@ def _read_episode_arrays(f: h5py.File, a: int, b: int) -> dict[str, np.ndarray]:
     return out
 
 
+def _resolve_h5_paths(data_path: str | Path) -> list[Path]:
+    """Return a list of H5 file paths from either a single file or a directory."""
+    data_path = Path(data_path)
+    if data_path.is_dir():
+        paths = sorted(data_path.glob("*.h5"))
+        if not paths:
+            raise FileNotFoundError(f"No .h5 files found in {data_path}")
+        return paths
+    return [data_path]
+
+
 def export_episodes_to_npz(
-    h5_path: str | Path,
+    data_path: str | Path,
     out_dir: str | Path,
     action_dim: int = NUM_ACTIONS,
     overwrite: bool = False,
 ) -> int:
-    """Slice an HDF5 replay into per-episode npz files. Returns number written.
+    """Slice HDF5 replay file(s) into per-episode npz files. Returns number written.
+
+    ``data_path`` may be a single ``.h5`` file or a directory of them.
 
     Cache invalidation: writes a small ``_EXPORT_SCHEMA`` marker. If the
     marker is missing or stale and ``out_dir`` already has npz files,
     re-export. Otherwise skip silently.
     """
-    h5_path = Path(h5_path)
+    h5_paths = _resolve_h5_paths(data_path)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     marker = out_dir / ".schema"
@@ -89,54 +102,55 @@ def export_episodes_to_npz(
         for p in out_dir.glob("*.npz"):
             p.unlink()
 
-    with h5py.File(h5_path, "r") as f:
-        n = f["action"].shape[0]
-        episode_starts = f["episode_starts"][:]
-        slices = _episode_slices(episode_starts, n)
-        print(f"[dreamer_export] {h5_path}: {n} steps, {len(slices)} episodes "
-              f"-> {out_dir} (state_dim={DREAMER_STATE_DIM})")
+    n_written = 0
+    global_ep_idx = 0
 
-        action_arr = f["action"][:]
-        reward_arr = f["reward"][:]
-        is_first_arr = f["is_first"][:].astype(bool)
-        done_arr = f["done"][:].astype(bool)
+    for h5_path in h5_paths:
+        with h5py.File(str(h5_path), "r") as f:
+            n = f["action"].shape[0]
+            episode_starts = f["episode_starts"][:]
+            slices = _episode_slices(episode_starts, n)
+            print(f"[dreamer_export] {h5_path}: {n} steps, {len(slices)} episodes "
+                  f"(state_dim={DREAMER_STATE_DIM})")
 
-        n_written = 0
-        for ep_idx, (a, b) in enumerate(slices):
-            length = b - a
-            if length < 2:
-                continue  # sample_episodes() in upstream skips these anyway
+            action_arr = f["action"][:]
+            reward_arr = f["reward"][:]
+            is_first_arr = f["is_first"][:].astype(bool)
+            done_arr = f["done"][:].astype(bool)
 
-            ep_primitives = _read_episode_arrays(f, a, b)
-            # Add a leading "L=1" axis so canonicalize_sample / _build_dreamer_vector
-            # work on (B=1, L=length, ...) arrays. Squeeze out afterwards.
-            ep_primitives = {k: v[None, :] for k, v in ep_primitives.items()}
-            ep_primitives = canonicalize_sample(ep_primitives)
-            vector = _build_dreamer_vector(ep_primitives)[0]  # (T, DREAMER_STATE_DIM)
+            for _, (a, b) in enumerate(slices):
+                length = b - a
+                if length < 2:
+                    continue
 
-            actions_int = action_arr[a:b].astype(np.int64)
-            action_oh = np.zeros((length, action_dim), dtype=np.float32)
-            action_oh[np.arange(length), actions_int] = 1.0
+                ep_primitives = _read_episode_arrays(f, a, b)
+                ep_primitives = {k: v[None, :] for k, v in ep_primitives.items()}
+                ep_primitives = canonicalize_sample(ep_primitives)
+                vector = _build_dreamer_vector(ep_primitives)[0]
 
-            is_first = is_first_arr[a:b].copy()
-            is_first[0] = True  # Dreamer requires first step of every chunk to flag reset
+                actions_int = action_arr[a:b].astype(np.int64)
+                action_oh = np.zeros((length, action_dim), dtype=np.float32)
+                action_oh[np.arange(length), actions_int] = 1.0
 
-            is_terminal = done_arr[a:b].copy()
-            is_terminal[-1] = True  # mark episode end so cont-head sees signal
+                is_first = is_first_arr[a:b].copy()
+                is_first[0] = True
 
-            ep = {
-                "vector": vector.astype(np.float32),
-                "image": np.zeros((length, 1, 1, 3), dtype=np.uint8),
-                "action": action_oh,
-                "reward": reward_arr[a:b].astype(np.float32),
-                "is_first": is_first,
-                "is_terminal": is_terminal,
-            }
-            # Upstream's load_episodes parses filename; the suffix encodes length.
-            filename = out_dir / f"ep{ep_idx:06d}-{length}.npz"
-            np.savez_compressed(filename, **ep)
-            n_written += 1
+                is_terminal = done_arr[a:b].copy()
+                is_terminal[-1] = True
 
-        marker.write_text(_EXPORT_SCHEMA)
-        print(f"[dreamer_export] wrote {n_written} episodes")
-        return n_written
+                ep = {
+                    "vector": vector.astype(np.float32),
+                    "image": np.zeros((length, 1, 1, 3), dtype=np.uint8),
+                    "action": action_oh,
+                    "reward": reward_arr[a:b].astype(np.float32),
+                    "is_first": is_first,
+                    "is_terminal": is_terminal,
+                }
+                filename = out_dir / f"ep{global_ep_idx:06d}-{length}.npz"
+                np.savez_compressed(filename, **ep)
+                n_written += 1
+                global_ep_idx += 1
+
+    marker.write_text(_EXPORT_SCHEMA)
+    print(f"[dreamer_export] wrote {n_written} episodes total from {len(h5_paths)} file(s)")
+    return n_written

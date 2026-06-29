@@ -467,6 +467,42 @@ def _gather_seq(ds: h5py.Dataset, all_idx: np.ndarray, batch_size: int, seq_len:
     return block[inverse].reshape(batch_size, seq_len, *ds.shape[1:])
 
 
+def _read_windows(
+    f: h5py.File,
+    picks: np.ndarray,
+    seq_len: int,
+    extra_keys: tuple[str, ...] = (),
+) -> dict[str, np.ndarray]:
+    """Read windows starting at ``picks`` (local start indices) from one file.
+
+    Like ``sample_window`` but without the ``rng.choice`` step — the caller
+    has already decided which starts to read.
+    """
+    batch_size = picks.shape[0]
+    all_idx = (picks[:, None] + np.arange(seq_len)[None, :]).reshape(-1)
+
+    out: dict[str, np.ndarray] = {}
+
+    for name in _TOP_LEVEL_SCHEMA:
+        out[name] = _gather_seq(f[name], all_idx, batch_size, seq_len)
+
+    for group_path, schema in GROUPS.items():
+        side_key = group_path.split("/")[-1]
+        for name in schema:
+            out[f"{side_key}/{name}"] = _gather_seq(
+                f[f"{group_path}/{name}"], all_idx, batch_size, seq_len
+            )
+
+    if "pixels" in f:
+        out["pixels"] = _gather_seq(f["pixels"], all_idx, batch_size, seq_len)
+
+    for key in extra_keys:
+        if key in f and key not in out:
+            out[key] = _gather_seq(f[key], all_idx, batch_size, seq_len)
+
+    return out
+
+
 def sample_window(
     f: h5py.File,
     valid_starts: np.ndarray,
@@ -480,28 +516,167 @@ def sample_window(
     they don't need a ``ReplayBuffer`` instance / writer thread).
     """
     pick = rng.choice(valid_starts, size=batch_size, replace=valid_starts.size < batch_size)
-    all_idx = (pick[:, None] + np.arange(seq_len)[None, :]).reshape(-1)
-
-    out: dict[str, np.ndarray] = {}
-
-    # Top-level columns.
-    for name in _TOP_LEVEL_SCHEMA:
-        out[name] = _gather_seq(f[name], all_idx, batch_size, seq_len)
-
-    # Named groups.
-    for group_path, schema in GROUPS.items():
-        side_key = group_path.split("/")[-1]
-        for name in schema:
-            out[f"{side_key}/{name}"] = _gather_seq(
-                f[f"{group_path}/{name}"], all_idx, batch_size, seq_len
-            )
-
-    if "pixels" in f:
-        out["pixels"] = _gather_seq(f["pixels"], all_idx, batch_size, seq_len)
-
-    return out
+    return _read_windows(f, pick, seq_len)
 
 
 def open_for_read(path: str) -> h5py.File:
     """Convenience: open the buffer file in read-only mode for training reads."""
     return h5py.File(path, "r")
+
+
+# --------------------------------------------------------------------------- #
+# Multi-file training reader
+# --------------------------------------------------------------------------- #
+
+
+class _MultiStarts:
+    """Valid sequence start indices across one or more H5 files.
+
+    Supports ``.size``, NumPy-style slicing, and batch sampling — a drop-in
+    for the flat ``np.ndarray`` the single-file path used to return.
+    """
+
+    __slots__ = ("file_indices", "local_starts")
+
+    def __init__(self, file_indices: np.ndarray, local_starts: np.ndarray) -> None:
+        self.file_indices = np.asarray(file_indices, dtype=np.int32)
+        self.local_starts = np.asarray(local_starts, dtype=np.int64)
+
+    @property
+    def size(self) -> int:
+        return len(self.file_indices)
+
+    def __len__(self) -> int:
+        return len(self.file_indices)
+
+    def __getitem__(self, idx):  # noqa: ANN001
+        return _MultiStarts(self.file_indices[idx], self.local_starts[idx])
+
+
+class DataReader:
+    """Unified read interface for training: single H5 file or a directory of them.
+
+    If ``path`` is a file, behaves like the old single-file path.
+    If ``path`` is a directory, opens every ``*.h5`` file inside it and
+    presents them as one logical dataset.
+
+    Usage::
+
+        with DataReader("data/replay.h5") as reader:     # single file
+            starts = reader.valid_seq_starts(seq_len=4)
+            batch = reader.sample_window(starts[:1000], 16, 4, rng)
+
+        with DataReader("/data/replays/") as reader:      # directory
+            ...
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        path = Path(path)
+        if path.is_dir():
+            h5_paths = sorted(path.glob("*.h5"))
+            if not h5_paths:
+                raise FileNotFoundError(f"No .h5 files found in {path}")
+        elif path.is_file() or path.suffix == ".h5":
+            h5_paths = [path]
+        else:
+            raise FileNotFoundError(f"{path} is not a file or directory")
+
+        self._files: list[h5py.File] = [h5py.File(str(p), "r") for p in h5_paths]
+        self._paths: list[str] = [str(p) for p in h5_paths]
+        self._sizes: list[int] = [f["action"].shape[0] for f in self._files]
+
+    def close(self) -> None:
+        for f in self._files:
+            f.close()
+        self._files.clear()
+
+    def __enter__(self) -> "DataReader":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    @property
+    def num_files(self) -> int:
+        return len(self._files)
+
+    @property
+    def paths(self) -> list[str]:
+        return list(self._paths)
+
+    @property
+    def total_frames(self) -> int:
+        return sum(self._sizes)
+
+    @property
+    def total_episodes(self) -> int:
+        return sum(f["episode_starts"].shape[0] for f in self._files)
+
+    def has_pixels(self) -> bool:
+        """True only when **all** loaded files contain a ``pixels`` dataset."""
+        return all("pixels" in f for f in self._files)
+
+    def has_key(self, key: str) -> bool:
+        """True when **all** loaded files contain the given top-level dataset."""
+        return all(key in f for f in self._files)
+
+    def valid_seq_starts(self, seq_len: int) -> _MultiStarts:
+        """Compute valid sequence starts across all loaded files."""
+        all_fi: list[np.ndarray] = []
+        all_local: list[np.ndarray] = []
+        for i, f in enumerate(self._files):
+            local = valid_seq_starts(f, seq_len)
+            if local.size > 0:
+                all_fi.append(np.full(local.size, i, dtype=np.int32))
+                all_local.append(local)
+        if not all_fi:
+            return _MultiStarts(np.array([], dtype=np.int32), np.array([], dtype=np.int64))
+        return _MultiStarts(np.concatenate(all_fi), np.concatenate(all_local))
+
+    def sample_window(
+        self,
+        starts: _MultiStarts,
+        batch_size: int,
+        seq_len: int,
+        rng: np.random.Generator,
+        extra_keys: tuple[str, ...] = (),
+    ) -> dict[str, np.ndarray]:
+        """Sample ``batch_size`` sequence windows. Returns the same dict
+        format as the single-file ``sample_window``."""
+        n = starts.size
+        pick_idx = rng.choice(n, size=batch_size, replace=n < batch_size)
+        picked_files = starts.file_indices[pick_idx]
+        picked_locals = starts.local_starts[pick_idx]
+
+        # Fast path: single file
+        if self.num_files == 1:
+            return _read_windows(self._files[0], picked_locals, seq_len, extra_keys)
+
+        unique_files = np.unique(picked_files)
+
+        # Read each file's subset independently
+        file_batches: dict[int, dict[str, np.ndarray]] = {}
+        local_pos = np.empty(batch_size, dtype=np.int64)
+
+        for fi in unique_files:
+            fi_int = int(fi)
+            mask = picked_files == fi_int
+            local_starts_for_file = picked_locals[mask]
+            file_batches[fi_int] = _read_windows(
+                self._files[fi_int], local_starts_for_file, seq_len, extra_keys
+            )
+            local_pos[np.where(mask)[0]] = np.arange(mask.sum())
+
+        # Reassemble in original pick order
+        sample_keys = list(next(iter(file_batches.values())).keys())
+        result: dict[str, np.ndarray] = {}
+        for k in sample_keys:
+            ref = next(iter(file_batches.values()))[k]
+            out = np.empty((batch_size, *ref.shape[1:]), dtype=ref.dtype)
+            for fi in unique_files:
+                fi_int = int(fi)
+                mask = picked_files == fi_int
+                out[mask] = file_batches[fi_int][k][local_pos[mask]]
+            result[k] = out
+
+        return result

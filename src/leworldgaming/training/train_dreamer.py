@@ -161,7 +161,8 @@ def train(
     # 1. Export episodes if needed.
     if not Path(cfg["data_path"]).exists():
         raise FileNotFoundError(
-            f"{cfg['data_path']} not found — run scripts/collect_data.py first"
+            f"{cfg['data_path']} not found — run scripts/collect_data.py first, "
+            "or point --data-path at a directory of .h5 files"
         )
     n_episodes = export_episodes_to_npz(
         cfg["data_path"], cfg["episode_dir"],

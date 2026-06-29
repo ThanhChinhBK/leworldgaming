@@ -1,8 +1,8 @@
-# Benchmark Plan: MCTS + World Models on FightingICE
+# Benchmark Plan: CEM + World Models on FightingICE
 
-This doc captures the plan for benchmarking four MCTS configurations on the
-FightingICE environment, and the data-collection / training-phase changes
-needed to support it.
+This doc captures the plan for benchmarking four CEM (Cross-Entropy Method)
+configurations on the FightingICE environment, and the data-collection /
+training-phase changes needed to support it.
 
 The planner implementation itself is **out of scope** here — this doc only
 covers what must be in place *before* the planner is written, so that all
@@ -12,25 +12,78 @@ four arms expose a comparable interface and the resulting numbers are fair.
 
 ## 1. The four arms
 
-All four use the same MCTS planner with the same hyperparameters. Only the
+All four use the same CEM planner with the same hyperparameters. Only the
 forward-rollout dynamics differ.
 
-1. **MCTS + true game forward simulator** — upper bound; uses the actual
-   game engine for rollouts. Requires either pyftg state snapshot/restore,
-   or falls back to the existing JVM `MctsAi23i.jar` baseline.
-2. **MCTS + LeWM** — JEPA encoder + AR predictor in latent space, plus
+1. **CEM + true game simulator** — upper bound; a custom Java AI that calls
+   the built-in `simulator.Simulator.simulate()` method for rollouts
+   (see §1.1 below).
+2. **CEM + LeWM** — JEPA encoder + AR predictor in latent space, plus
    reward / value / continuation heads bolted on (Stage-B trainer below).
-3. **MCTS + Dreamer** — DreamerV3 RSSM, reward + value + continuation
+3. **CEM + Dreamer** — DreamerV3 RSSM, reward + value + continuation
    heads trained end-to-end.
-4. **MCTS + PETS** — ensemble dynamics on physical state, analytic reward.
+4. **CEM + PETS** — ensemble dynamics on physical state, analytic reward.
+
+### Why CEM instead of MCTS
+
+The original LeWM paper uses CEM for planning. CEM is simpler than MCTS
+(no tree, no UCB, no expansion policy), has fewer hyperparameters
+(`candidates`, `elites`, `iterations`, `horizon`), and directly measures
+forward-model quality: "given a budget of N rollouts of length H, how good
+is the best action sequence your model can find?" Any difference in axis A
+is then attributable to the world model, not tree-search details.
+
+### 1.1 Arm 1: true game simulator (Java CEM AI)
+
+FightingICE includes a built-in `simulator.Simulator` class (in
+`src/simulator/Simulator.java`) that steps the **real game physics** —
+hit detection, character state, projectiles, pushback — without rendering.
+It is accessible to Java AIs via `gameData.getSimulator()`.
+
+```java
+// Simulator API (already in FightingICE)
+public FrameData simulate(FrameData frameData, boolean playerNumber,
+    Deque<Action> myAct, Deque<Action> oppAct, int simulationLimit)
+```
+
+`SimFighting` (the internal implementation) extends `Fighting` — it runs
+the exact same physics loop as the live game, including `processingFight`,
+`calculationHit`, `updateAttackParameter`, and `updateCharacter`.
+
+**Note on existing JVM baselines:** `MctsAi23i.jar` and `MctsAiZoning.jar`
+already use this simulator, but they are extremely weak:
+- MctsAi23i: MCTS with **23 iteration cap** and **16.5ms time budget**
+- MctsAiZoning: same structure with positional heuristics
+- Both placed last in the 2025 DareFightingICE competition
+
+For Arm 1 we need a custom Java CEM AI with proper rollout depth:
+
+```
+CEM parameters (shared across all arms):
+  horizon        = 100 frames (~1.67s of game time)
+  candidates     = 200 action sequences per iteration
+  elites         = 20 (top-k to keep)
+  iterations     = 5 CEM refinement iterations
+  opponent_model = random actions (same assumption for all arms)
+
+Per decision:
+  200 candidates × 5 iterations = 1000 simulate() calls
+  Each simulate(100 frames) ≈ <1ms (pure physics, no rendering)
+  Total ≈ ~1 second per decision
+  With --input-sync the game waits — no time pressure.
+```
+
+Arm 1 is implemented as a Java AI JAR placed in `data/ai/`, compiled
+against the FightingICE classpath. Arms 2–4 are Python pyftg AIs that
+run the same CEM loop but roll out through their respective world models.
 
 ### Why fixed shared planner hyperparameters
 
-MCTS knobs (`sims`, `depth`, `c_puct`) heavily affect strength independent
-of the world model. Tuning them per-arm conflates "model quality" with
-"compute budget." Sweep once on a held-out subset, freeze a single config,
-use it for all four arms. Any difference in axis A is then attributable to
-the world model, not the planner.
+CEM knobs (`candidates`, `elites`, `iterations`, `horizon`) affect strength
+independent of the world model. Tuning them per-arm conflates "model
+quality" with "compute budget." Sweep once on a held-out subset, freeze a
+single config, use it for all four arms. Any difference in axis A is then
+attributable to the world model, not the planner.
 
 ---
 
@@ -42,7 +95,7 @@ three axes:
 
 | Axis | Metric | Output space | What it measures |
 |------|--------|--------------|------------------|
-| **A. Planning win-rate** | win % and HP-differential vs fixed JVM opponents (`MctsAi23i`, `MctsAiZoning`, …), seeded | game outcomes | end-to-end control |
+| **A. Planning win-rate** | win % and HP-differential vs fixed JVM opponents (`MctsAi23i`, `MctsAiZoning`), seeded | game outcomes | end-to-end control |
 | **B. k-step output prediction** | reward + termination error at `k = 1, 5, 10, 20`, decoded to physical units (HP-delta; Bernoulli) | physical units | dynamics + head quality |
 | **C. Probe R²** | linear probe of latent → HP_self, HP_opp, energy_self, energy_opp, x_diff, y_diff | per-model, same target | representation quality |
 
@@ -93,7 +146,6 @@ space is value-equivalent.
    data into evaluation.
 
 ### Not needed at this phase
-- pyftg state snapshot/restore (planner-phase concern)
 - new observation fields beyond what's listed above
 - reward shaping
 
@@ -121,7 +173,7 @@ pred_proj, trained with JEPA prediction loss + SIGReg. Produces
   | `LinearProbe` (existing) | `agents/lewm/probe.py` | `z → 4 physical signals` | MSE — **currently random; this finally trains it** |
 - Add **imagined-rollout consistency**: apply reward + continuation losses
   on predictor-rolled latents `ẑ_{t+k}` for `k = 1..H`, not only on
-  encoder-produced `z_t`. MCTS uses rolled latents at inference, so heads
+  encoder-produced `z_t`. CEM uses rolled latents at inference, so heads
   must work there.
 - Extract shared replay-loading utilities (`_valid_seq_start_indices`,
   `_sample_sequence_batch`, `_to_device_seq`) from `train_lewm.py` into

@@ -19,7 +19,7 @@ import torch
 import yaml
 
 from leworldgaming.agents.pets.agent import PETSAgent
-from leworldgaming.data.replay_buffer import open_for_read, sample_window, valid_seq_starts
+from leworldgaming.data.replay_buffer import DataReader
 from leworldgaming.data.views import view_pets
 from leworldgaming.env.action_space import NUM_ACTIONS
 from leworldgaming.env.state_vector import PETS_STATE_DIM
@@ -68,14 +68,14 @@ def _load_config(path: str | Path | None, overrides: dict[str, Any]) -> dict[str
 
 
 def _sample_transition_batch(
-    f,
-    valid_starts: np.ndarray,
+    reader: DataReader,
+    valid_starts,
     batch_size: int,
     rng: np.random.Generator,
     max_hp: float,
 ) -> dict[str, np.ndarray]:
     """One PETS-shaped batch: ``(s, a, s_next, r)``."""
-    sample = sample_window(f, valid_starts, batch_size, seq_len=2, rng=rng)
+    sample = reader.sample_window(valid_starts, batch_size, seq_len=2, rng=rng)
     return view_pets(sample)
 
 
@@ -93,7 +93,8 @@ def train(
 
     if not Path(cfg["data_path"]).exists():
         raise FileNotFoundError(
-            f"{cfg['data_path']} not found — run scripts/collect_data.py first"
+            f"{cfg['data_path']} not found — run scripts/collect_data.py first, "
+            "or point --data-path at a directory of .h5 files"
         )
 
     agent = PETSAgent(cfg=cfg, device=device)
@@ -116,9 +117,9 @@ def train(
     history: list[dict[str, float]] = []
     val_history: list[dict[str, float]] = []
 
-    f = open_for_read(cfg["data_path"])
+    reader = DataReader(cfg["data_path"])
     try:
-        starts = valid_seq_starts(f, seq_len=2)
+        starts = reader.valid_seq_starts(seq_len=2)
         if starts.size == 0:
             raise RuntimeError("No valid transitions in replay buffer.")
         n = starts.size
@@ -126,9 +127,10 @@ def train(
         n_val = min(n_val, max(n - batch_size, 0))
         train_starts = starts[: n - n_val]
         val_starts = starts[n - n_val :] if n_val > 0 else starts
-        print(f"[train_pets] frames={f['action'].shape[0]} valid_transitions={n} "
+        print(f"[train_pets] files={reader.num_files} frames={reader.total_frames} "
+              f"valid_transitions={n} "
               f"train={train_starts.size} val={val_starts.size} "
-              f"episodes={f['episode_starts'].shape[0]}")
+              f"episodes={reader.total_episodes}")
 
         @torch.no_grad()
         def evaluate() -> dict[str, float]:
@@ -138,7 +140,7 @@ def train(
             val_rng = np.random.default_rng(12345)
             for _ in range(n_batches):
                 batch = _sample_transition_batch(
-                    f, val_starts, batch_size, val_rng, max_hp
+                    reader, val_starts, batch_size, val_rng, max_hp
                 )
                 s = torch.as_tensor(batch["s"], device=device)
                 a = torch.as_tensor(batch["a"], device=device, dtype=torch.long)
@@ -150,7 +152,7 @@ def train(
 
         t0 = time.time()
         for step in range(num_steps):
-            batch = _sample_transition_batch(f, train_starts, batch_size, rng, max_hp)
+            batch = _sample_transition_batch(reader, train_starts, batch_size, rng, max_hp)
             metrics = agent.learn(batch)
             loss = metrics["loss"]
 
@@ -188,7 +190,7 @@ def train(
         print(f"[train_pets] done in {elapsed:.1f}s ({num_steps / max(elapsed, 1e-9):.1f} step/s)")
 
     finally:
-        f.close()
+        reader.close()
 
     ckpt_path = Path(cfg["ckpt_path"])
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)

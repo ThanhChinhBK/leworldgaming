@@ -17,9 +17,9 @@ dependencies = [
     "pyyaml>=6",
     "omegaconf>=2.3",
     "tqdm>=4.66",
-    # ML
-    "torch>=2.5",
-    "torchvision>=0.20",
+    # ML — torch>=2.7 ships cu128 wheels with sm_120 (Blackwell, e.g. RTX 50xx) kernels.
+    "torch>=2.7",
+    "torchvision>=0.22",
     "einops>=0.8",
     # Vendored dreamerv3-torch deps
     "ruamel.yaml>=0.18",
@@ -45,16 +45,16 @@ build-backend = "hatchling.build"
 packages = ["src/leworldgaming"]
 
 # Per-platform torch wheel sourcing.
-# Mac → CPU wheel (works with MPS); Linux → cu121.
+# Mac → CPU wheel (works with MPS); Linux → cu128 (Blackwell sm_120 support).
 # `uv sync` resolves automatically based on host sys_platform.
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
-    { index = "pytorch-cu121", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
 ]
 torchvision = [
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
-    { index = "pytorch-cu121", marker = "sys_platform == 'linux'" },
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
 ]
 
 [[tool.uv.index]]
@@ -63,8 +63,8 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.ruff]

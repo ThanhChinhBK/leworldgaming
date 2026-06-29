@@ -38,6 +38,7 @@ ckpt_path: data/lewm_checkpoint.pt
 log_every: 10
 val_split: 0.1
 val_every: 25
+val_batches: 8        # cap validation batches per eval (0 = full val set)
 seed: 0
 
 # Inference-time planner (not used by train_lewm.py)

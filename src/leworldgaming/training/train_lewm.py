@@ -39,7 +39,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import h5py
 import numpy as np
 import torch
 import yaml
@@ -50,10 +49,9 @@ from leworldgaming.agents.lewm.encoder import Encoder
 from leworldgaming.agents.lewm.predictor import Predictor
 from leworldgaming.agents.lewm.projector import Projector
 from leworldgaming.agents.lewm.sigreg import SIGReg
+from leworldgaming.data.replay_buffer import DataReader
 from leworldgaming.training._replay_utils import (
-    sample_sequence_batch as _sample_sequence_batch,
     to_device_seq as _to_device_seq,
-    valid_seq_start_indices as _valid_seq_start_indices,
 )
 from leworldgaming.utils.device import amp_autocast, best_device
 from leworldgaming.utils.seed import set_seed
@@ -93,6 +91,7 @@ DEFAULTS: dict[str, Any] = {
     "log_every": 10,
     "val_split": 0.1,
     "val_every": 25,
+    "val_batches": 8,
     "seed": 0,
 }
 
@@ -126,7 +125,8 @@ def train(
 
     if not Path(cfg["data_path"]).exists():
         raise FileNotFoundError(
-            f"{cfg['data_path']} not found — run scripts/collect_data.py --pixels first"
+            f"{cfg['data_path']} not found — run scripts/collect_data.py --pixels first, "
+            "or point --data-path at a directory of .h5 files"
         )
 
     encoder = Encoder(
@@ -220,10 +220,15 @@ def train(
         z_norm = ctx_emb.float().norm(dim=-1).mean()
         return pred_loss, reg_loss, z_norm
 
-    with h5py.File(cfg["data_path"], "r") as f:
-        valid_starts = _valid_seq_start_indices(f, seq_len)
+    with DataReader(cfg["data_path"]) as reader:
+        valid_starts = reader.valid_seq_starts(seq_len)
         if valid_starts.size == 0:
             raise RuntimeError("No valid sequences in replay buffer.")
+
+        if not reader.has_pixels():
+            raise RuntimeError(
+                "LeWM requires pixel data — re-collect with --pixels or check your data directory."
+            )
 
         n = valid_starts.size
         n_val = max(int(n * float(cfg["val_split"])), batch_size)
@@ -231,9 +236,9 @@ def train(
         train_starts = valid_starts[: n - n_val]
         val_starts = valid_starts[n - n_val :]
         print(
-            f"[train_lewm] frames={f['action'].shape[0]} "
+            f"[train_lewm] files={reader.num_files} frames={reader.total_frames} "
             f"valid_seq_starts={n} train={train_starts.size} val={val_starts.size} "
-            f"episodes={f['episode_starts'].shape[0]}"
+            f"episodes={reader.total_episodes}"
         )
 
         @torch.no_grad()
@@ -242,12 +247,17 @@ def train(
             sigregs: list[float] = []
             znorms: list[float] = []
             n_batches = max(1, val_starts.size // batch_size)
+            val_batches = int(cfg.get("val_batches", 0) or 0)
+            if val_batches > 0:
+                n_batches = min(n_batches, val_batches)
             val_rng = np.random.default_rng(12345)
             for _ in range(n_batches):
-                pixels_np, actions_np = _sample_sequence_batch(
-                    f, val_starts, batch_size, seq_len, val_rng
+                batch = reader.sample_window(
+                    val_starts, batch_size, seq_len, val_rng
                 )
-                pixels, a_oh = _to_device_seq(pixels_np, actions_np, action_dim, device)
+                pixels, a_oh = _to_device_seq(
+                    batch["pixels"], batch["action"], action_dim, device
+                )
                 pl, rl, zn = _step_forward(pixels, a_oh)
                 losses.append(pl.item())
                 sigregs.append(rl.item())
@@ -261,10 +271,12 @@ def train(
         t0 = time.time()
         modules.train()
         for step in range(num_steps):
-            pixels_np, actions_np = _sample_sequence_batch(
-                f, train_starts, batch_size, seq_len, rng
+            batch = reader.sample_window(
+                train_starts, batch_size, seq_len, rng
             )
-            pixels, a_oh = _to_device_seq(pixels_np, actions_np, action_dim, device)
+            pixels, a_oh = _to_device_seq(
+                batch["pixels"], batch["action"], action_dim, device
+            )
 
             with amp_autocast(device):
                 pred_loss, reg_loss, z_norm = _step_forward(pixels, a_oh)

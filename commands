@@ -1,0 +1,31 @@
+ DATA_DIR="/media/jeovach/New Volume/leworldgaming"
+ 
+ # 1. random vs random (baseline)
+ uv run python scripts/collect_data.py --games 20 --policy-p1 random --policy-p2 random --seed 1 --pixels --out "$DATA_DIR/01_random_v_random.h5"
+ 
+ # 2. aggressive vs random
+ uv run python scripts/collect_data.py --games 20 --policy-p1 aggressive --policy-p2 random --seed 2 --pixels --out "$DATA_DIR/02_aggressive_v_random.h5"
+ 
+ # 3. defensive vs random
+ uv run python scripts/collect_data.py --games 20 --policy-p1 defensive --policy-p2 random --seed 3 --pixels --out "$DATA_DIR/03_defensive_v_random.h5"
+ 
+ # 4. mixed vs random
+ uv run python scripts/collect_data.py --games 20 --policy-p1 mixed --policy-p2 random --seed 4 --pixels --out "$DATA_DIR/04_mixed_v_random.h5"
+ 
+ # 5. random vs aggressive
+ uv run python scripts/collect_data.py --games 20 --policy-p1 random --policy-p2 aggressive --seed 5 --pixels --out "$DATA_DIR/05_random_v_aggressive.h5"
+ 
+ # 6. aggressive vs defensive
+ uv run python scripts/collect_data.py --games 20 --policy-p1 aggressive --policy-p2 defensive --seed 6 --pixels --out "$DATA_DIR/06_aggressive_v_defensive.h5"
+ 
+ # 7. random vs MctsAi23i
+ uv run python scripts/collect_data.py --games 20 --policy-p1 random --policy-p2 MctsAi23i --seed 7 --pixels --out "$DATA_DIR/07_random_v_mcts23i.h5"
+ 
+ # 8. aggressive vs MctsAi23i
+ uv run python scripts/collect_data.py --games 20 --policy-p1 aggressive --policy-p2 MctsAi23i --seed 8 --pixels --out "$DATA_DIR/08_aggressive_v_mcts23i.h5"
+ 
+ # 9. mixed vs MctsAiZoning
+ uv run python scripts/collect_data.py --games 20 --policy-p1 mixed --policy-p2 MctsAiZoning --seed 9 --pixels --out "$DATA_DIR/09_mixed_v_mctszoning.h5"
+ 
+ # 10. defensive vs MctsAiZoning
+ uv run python scripts/collect_data.py --games 20 --policy-p1 defensive --policy-p2 MctsAiZoning --seed 10 --pixels --out "$DATA_DIR/10_defensive_v_mctszoning.h5"

@@ -36,7 +36,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import h5py
 import numpy as np
 import torch
 import yaml
@@ -52,10 +51,9 @@ from leworldgaming.agents.lewm.projector import Projector
 from leworldgaming.agents.lewm.reward_head import RewardHead
 from leworldgaming.agents.lewm.twohot import make_bins, twohot_ce_loss, twohot_decode
 from leworldgaming.agents.lewm.value_head import ValueHead
+from leworldgaming.data.replay_buffer import DataReader
 from leworldgaming.training._replay_utils import (
-    sample_sequence_batch_with_extras,
     to_device_seq,
-    valid_seq_start_indices,
 )
 from leworldgaming.utils.device import amp_autocast, best_device
 from leworldgaming.utils.seed import set_seed
@@ -189,7 +187,10 @@ def train(
     print(f"[train_lewm_heads] data={cfg['data_path']} ckpt_in={cfg['ckpt_in']} ckpt_out={cfg['ckpt_out']}")
 
     if not Path(cfg["data_path"]).exists():
-        raise FileNotFoundError(f"{cfg['data_path']} not found — run scripts/collect_data.py --pixels first")
+        raise FileNotFoundError(
+            f"{cfg['data_path']} not found — run scripts/collect_data.py --pixels first, "
+            "or point --data-path at a directory of .h5 files"
+        )
     if not Path(cfg["ckpt_in"]).exists():
         raise FileNotFoundError(
             f"{cfg['ckpt_in']} not found — train Stage A first via scripts/train.py --agent lewm"
@@ -406,8 +407,8 @@ def train(
         for p, p_tgt in zip(value_head.parameters(), value_target_head.parameters()):
             p_tgt.data.mul_(target_ema).add_(p.data, alpha=1.0 - target_ema)
 
-    with h5py.File(cfg["data_path"], "r") as f:
-        valid_starts = valid_seq_start_indices(f, seq_len)
+    with DataReader(cfg["data_path"]) as reader:
+        valid_starts = reader.valid_seq_starts(seq_len)
         if valid_starts.size == 0:
             raise RuntimeError("No valid sequences in replay buffer.")
 
@@ -417,28 +418,28 @@ def train(
         train_starts = valid_starts[: n - n_val]
         val_starts = valid_starts[n - n_val :]
         print(
-            f"[train_lewm_heads] frames={f['action'].shape[0]} "
+            f"[train_lewm_heads] files={reader.num_files} frames={reader.total_frames} "
             f"valid_seq_starts={n} train={train_starts.size} val={val_starts.size} "
-            f"episodes={f['episode_starts'].shape[0]}"
+            f"episodes={reader.total_episodes}"
         )
 
-        # Probe needs state_vector; only fetch it if enabled to save I/O.
+        # Probe needs state_vector; only fetch it if enabled and available.
         extra_keys: tuple[str, ...] = ("reward", "done")
-        if w_probe > 0.0 and "state_vector" in f:
+        if w_probe > 0.0 and reader.has_key("state_vector"):
             extra_keys = extra_keys + ("state_vector",)
 
         def _make_batch(
-            starts: np.ndarray, batch_rng: np.random.Generator
+            starts, batch_rng: np.random.Generator
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-            pixels_np, actions_np, extras = sample_sequence_batch_with_extras(
-                f, starts, batch_size, seq_len, batch_rng, extra_keys
+            batch = reader.sample_window(
+                starts, batch_size, seq_len, batch_rng, extra_keys=extra_keys
             )
-            pixels, a_oh = to_device_seq(pixels_np, actions_np, action_dim, device)
-            rewards = torch.from_numpy(extras["reward"]).to(device, dtype=torch.float32)
-            dones = torch.from_numpy(extras["done"]).to(device, dtype=torch.float32)
+            pixels, a_oh = to_device_seq(batch["pixels"], batch["action"], action_dim, device)
+            rewards = torch.from_numpy(batch["reward"]).to(device, dtype=torch.float32)
+            dones = torch.from_numpy(batch["done"]).to(device, dtype=torch.float32)
             state_vec: torch.Tensor | None = None
-            if "state_vector" in extras:
-                state_vec = torch.from_numpy(extras["state_vector"]).to(device, dtype=torch.float32)
+            if "state_vector" in batch:
+                state_vec = torch.from_numpy(batch["state_vector"]).to(device, dtype=torch.float32)
             return pixels, a_oh, rewards, dones, state_vec
 
         @torch.no_grad()

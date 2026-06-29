@@ -1,10 +1,15 @@
 """Mid-week training driver. Dispatches to LeWM (Stage A or B), Dreamer, or PETS.
 
+``--data-path`` accepts either a single ``.h5`` file or a directory of them.
+When a directory is given, all ``*.h5`` files inside are loaded and sampled
+from jointly during training.
+
 Examples:
     uv run python scripts/train.py --agent lewm --steps 50 --batch-size 8
     uv run python scripts/train.py --agent lewm --stage b --steps 20000
-    uv run python scripts/train.py --agent dreamer --steps 100 --image-size 64
+    uv run python scripts/train.py --agent dreamer --steps 100
     uv run python scripts/train.py --agent pets --steps 500
+    uv run python scripts/train.py --agent pets --data-path /path/to/h5_folder/
 """
 
 from __future__ import annotations
