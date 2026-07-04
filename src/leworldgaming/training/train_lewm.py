@@ -92,6 +92,7 @@ DEFAULTS: dict[str, Any] = {
     "val_split": 0.1,
     "val_every": 25,
     "val_batches": 8,
+    "ckpt_every": 1000,
     "seed": 0,
 }
 
@@ -196,6 +197,27 @@ def train(
     val_every = int(cfg["val_every"])
     batch_size = int(cfg["batch_size"])
     action_dim = int(cfg["action_dim"])
+    ckpt_every = int(cfg.get("ckpt_every", 0) or 0)
+    ckpt_path = Path(cfg["ckpt_path"])
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _save_ckpt(step_done: int, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        torch.save(
+            {
+                "encoder": encoder.state_dict(),
+                "projector": projector.state_dict(),
+                "action_encoder": action_encoder.state_dict(),
+                "predictor": predictor.state_dict(),
+                "pred_proj": pred_proj.state_dict(),
+                "optim": optim.state_dict(),
+                "config": cfg,
+                "num_steps": step_done,
+            },
+            tmp,
+        )
+        tmp.replace(dest)
 
     history: list[dict[str, float]] = []
     val_history: list[dict[str, float]] = []
@@ -316,23 +338,14 @@ def train(
                     f"|z|={val_metrics['val_z_norm']:.2f}"
                 )
 
+            if ckpt_every > 0 and step > 0 and step % ckpt_every == 0:
+                _save_ckpt(step, ckpt_path)
+                print(f"[train_lewm] step={step:5d}  saved checkpoint -> {ckpt_path}")
+
         elapsed = time.time() - t0
         print(f"[train_lewm] done in {elapsed:.1f}s ({num_steps / elapsed:.1f} step/s)")
 
-    ckpt_path = Path(cfg["ckpt_path"])
-    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "encoder": encoder.state_dict(),
-            "projector": projector.state_dict(),
-            "action_encoder": action_encoder.state_dict(),
-            "predictor": predictor.state_dict(),
-            "pred_proj": pred_proj.state_dict(),
-            "config": cfg,
-            "num_steps": num_steps,
-        },
-        ckpt_path,
-    )
+    _save_ckpt(num_steps, ckpt_path)
     print(f"[train_lewm] saved checkpoint -> {ckpt_path}")
 
     return {

@@ -456,15 +456,21 @@ def valid_seq_starts(f: h5py.File, seq_len: int) -> np.ndarray:
     return candidates[valid]
 
 
-def _gather_seq(ds: h5py.Dataset, all_idx: np.ndarray, batch_size: int, seq_len: int) -> np.ndarray:
-    """Read ``all_idx`` (flat) once, then unflatten to ``(B, L, ...)``.
+def _gather_seq(ds: h5py.Dataset, picks: np.ndarray, seq_len: int) -> np.ndarray:
+    """Read a ``seq_len``-length window per start in ``picks`` → ``(B, L, ...)``.
 
-    h5py fancy indexing requires strictly-increasing indices, so we go through
-    a unique-then-inverse-map detour for free deduplication on overlapping
-    windows."""
-    union, inverse = np.unique(all_idx, return_inverse=True)
-    block = ds[union]
-    return block[inverse].reshape(batch_size, seq_len, *ds.shape[1:])
+    Each window is read as a *contiguous* slice ``ds[s:s+seq_len]`` rather than
+    via one scattered fancy-index gather. h5py point-selection on hundreds of
+    non-contiguous indices is dominated by per-element selection overhead and
+    is ~50× slower than contiguous slab reads here (measured 72 fps vs 3535 fps
+    on the 224×224 pixel dataset), so this loop is the fast path even though it
+    issues ``B`` reads instead of one."""
+    batch_size = picks.shape[0]
+    out = np.empty((batch_size, seq_len, *ds.shape[1:]), dtype=ds.dtype)
+    for i in range(batch_size):
+        s = int(picks[i])
+        out[i] = ds[s : s + seq_len]
+    return out
 
 
 def _read_windows(
@@ -478,27 +484,24 @@ def _read_windows(
     Like ``sample_window`` but without the ``rng.choice`` step — the caller
     has already decided which starts to read.
     """
-    batch_size = picks.shape[0]
-    all_idx = (picks[:, None] + np.arange(seq_len)[None, :]).reshape(-1)
-
     out: dict[str, np.ndarray] = {}
 
     for name in _TOP_LEVEL_SCHEMA:
-        out[name] = _gather_seq(f[name], all_idx, batch_size, seq_len)
+        out[name] = _gather_seq(f[name], picks, seq_len)
 
     for group_path, schema in GROUPS.items():
         side_key = group_path.split("/")[-1]
         for name in schema:
             out[f"{side_key}/{name}"] = _gather_seq(
-                f[f"{group_path}/{name}"], all_idx, batch_size, seq_len
+                f[f"{group_path}/{name}"], picks, seq_len
             )
 
     if "pixels" in f:
-        out["pixels"] = _gather_seq(f["pixels"], all_idx, batch_size, seq_len)
+        out["pixels"] = _gather_seq(f["pixels"], picks, seq_len)
 
     for key in extra_keys:
         if key in f and key not in out:
-            out[key] = _gather_seq(f[key], all_idx, batch_size, seq_len)
+            out[key] = _gather_seq(f[key], picks, seq_len)
 
     return out
 

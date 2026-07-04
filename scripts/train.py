@@ -36,6 +36,12 @@ def main() -> None:
     parser.add_argument("--ckpt-in", type=str, default=None,
                         help="LeWM Stage B: path to Stage-A checkpoint to load (overrides config).")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--val-every", type=int, default=None,
+                        help="LeWM: validate every N steps (0 disables). Raise for long runs.")
+    parser.add_argument("--val-batches", type=int, default=None,
+                        help="LeWM: cap validation batches per eval (0 = full val set).")
+    parser.add_argument("--ckpt-every", type=int, default=None,
+                        help="LeWM Stage A: save a checkpoint every N steps (0 disables periodic saves).")
     args = parser.parse_args()
 
     overrides = {
@@ -45,6 +51,9 @@ def main() -> None:
         "data_path": args.data_path,
         "ckpt_path": args.ckpt_path,
         "seed": args.seed,
+        "val_every": args.val_every,
+        "val_batches": args.val_batches,
+        "ckpt_every": args.ckpt_every,
     }
 
     if args.agent == "lewm" and args.stage == "b":
@@ -53,6 +62,7 @@ def main() -> None:
         # Stage B uses ckpt_in / ckpt_out, not the Stage-A ckpt_path.
         overrides.pop("sigreg_lambda", None)
         overrides.pop("ckpt_path", None)
+        overrides.pop("ckpt_every", None)
         if args.ckpt_in is not None:
             overrides["ckpt_in"] = args.ckpt_in
         if args.ckpt_path is not None:
@@ -70,12 +80,14 @@ def main() -> None:
         # Dreamer doesn't use sigreg_lambda; drop it to avoid a stray override.
         overrides.pop("sigreg_lambda", None)
         overrides.pop("lr", None)  # use model_lr / actor_lr / critic_lr instead
+        overrides.pop("ckpt_every", None)
         train(num_steps=args.steps,
               config_path=args.config or "configs/dreamer.yaml", **overrides)
     else:  # pets
         from leworldgaming.training.train_pets import train
 
         overrides.pop("sigreg_lambda", None)
+        overrides.pop("ckpt_every", None)
         train(num_steps=args.steps,
               config_path=args.config or "configs/pets.yaml", **overrides)
 
