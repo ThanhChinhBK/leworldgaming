@@ -49,6 +49,9 @@ DEFAULTS: dict[str, Any] = {
     "logdir": "data/dreamer_logs",
     "state_dim": DREAMER_STATE_DIM,
     "num_actions": NUM_ACTIONS,
+    # Observation mode: "vector" (proprio, default) | "image" (full pixels).
+    "obs_mode": "vector",
+    "image_size": 64,
     # Optimization
     "batch_size": 16,
     "batch_length": 64,
@@ -79,13 +82,16 @@ def _load_config(path: str | Path | None, overrides: dict[str, Any]) -> dict[str
 
 def _build_dreamer_config(cfg: dict[str, Any], device: torch.device) -> Namespace:
     """Compose the vendored Dreamer's full config from upstream defaults +
-    the dmc_proprio section + our overrides. Returns an ``argparse.Namespace``.
+    the mode-specific section + our overrides. Returns an ``argparse.Namespace``.
 
-    Inheriting from ``dmc_proprio`` (rather than ``dmc_vision``) sets
-    ``encoder.cnn_keys='$^'`` and ``encoder.mlp_keys='.*'`` so the MLP path
-    handles the ``"vector"`` observation we materialize in
-    ``dreamer_export``. The dummy ``"image"`` key is ignored by the
-    encoder regex but satisfies the unconditional preprocess step.
+    ``obs_mode="vector"`` inherits from ``dmc_proprio`` (``encoder.cnn_keys='$^'``,
+    ``encoder.mlp_keys='.*'``) so the MLP path handles the ``"vector"``
+    observation. The dummy ``"image"`` key is ignored by the encoder regex but
+    satisfies the unconditional preprocess step.
+
+    ``obs_mode="image"`` inherits from ``dmc_vision`` (``encoder.cnn_keys='image'``,
+    ``encoder.mlp_keys='$^'``) so the ConvEncoder/ConvDecoder process the real
+    ``image_size``² frame. ``size`` is set to the export image size.
     """
     import ruamel.yaml as ryaml
 
@@ -100,9 +106,16 @@ def _build_dreamer_config(cfg: dict[str, Any], device: torch.device) -> Namespac
             else:
                 base[k] = v
 
+    obs_mode = cfg.get("obs_mode", "vector")
+    base_section = "dmc_vision" if obs_mode == "image" else "dmc_proprio"
+
     merged: dict[str, Any] = {}
     deep_update(merged, configs["defaults"])
-    deep_update(merged, configs["dmc_proprio"])
+    deep_update(merged, configs[base_section])
+
+    if obs_mode == "image":
+        size = int(cfg["image_size"])
+        merged["size"] = [size, size]
 
     # Discrete-action overrides (mirrors the ``crafter`` config).
     merged["actor"]["dist"] = cfg["actor_dist"]
@@ -167,6 +180,8 @@ def train(
     n_episodes = export_episodes_to_npz(
         cfg["data_path"], cfg["episode_dir"],
         action_dim=num_actions,
+        obs_mode=cfg.get("obs_mode", "vector"),
+        image_size=int(cfg.get("image_size", 64)),
     )
     if n_episodes == 0:
         raise RuntimeError(
@@ -197,7 +212,11 @@ def train(
         dreamer_networks.MLP.__init__ = _patched_mlp_init
         dreamer_networks.MLP._lwg_patched = True
 
-    obs_space = make_obs_space(state_dim)
+    obs_space = make_obs_space(
+        state_dim,
+        obs_mode=cfg.get("obs_mode", "vector"),
+        image_size=int(cfg.get("image_size", 64)),
+    )
     act_space = make_action_space(num_actions)
 
     dreamer_cfg = _build_dreamer_config(cfg, device)
@@ -273,6 +292,8 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--batch-length", type=int, default=None)
     parser.add_argument("--state-dim", type=int, default=None)
+    parser.add_argument("--obs-mode", type=str, default=None, choices=["vector", "image"])
+    parser.add_argument("--image-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--compile", action="store_true", default=None)
@@ -285,6 +306,8 @@ def main() -> None:
         "batch_size": args.batch_size,
         "batch_length": args.batch_length,
         "state_dim": args.state_dim,
+        "obs_mode": args.obs_mode,
+        "image_size": args.image_size,
         "seed": args.seed,
         "device": args.device,
         "compile": args.compile,

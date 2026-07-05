@@ -2,8 +2,9 @@
 vendored ``external/dreamerv3-torch`` offline trainer.
 
 The upstream trainer reads its dataset via ``tools.load_episodes(directory)``
-which expects one ``.npz`` per episode. With Dreamer running in vector
-(proprio) mode, the keys consumed by ``WorldModel.preprocess`` are::
+which expects one ``.npz`` per episode. Two obs modes are supported:
+
+``obs_mode="vector"`` (proprio) — keys consumed by ``WorldModel.preprocess``::
 
     vector      (T, DREAMER_STATE_DIM)  float32   side-canonicalized
     image       (T, 1, 1, 3)            uint8     dummy (see views.py B.3)
@@ -16,6 +17,20 @@ The dummy ``image`` exists solely because ``WorldModel.preprocess`` at
 ``external/dreamerv3-torch/models.py:182`` unconditionally executes
 ``obs["image"] = obs["image"] / 255.0``. With ``encoder.cnn_keys: '$^'``
 the MultiEncoder skips it; the placeholder costs 3 bytes per timestep.
+
+``obs_mode="image"`` (vision) — full pixel-based DreamerV3. The replay
+buffer's ``pixels (T, 3, 224, 224) uint8`` are down-sampled to a HWC
+``image`` the upstream ``ConvEncoder`` consumes directly::
+
+    image       (T, S, S, 3)            uint8     S = image_size (default 64)
+    action      (T, A)                  float32   one-hot
+    reward      (T,)                    float32
+    is_first    (T,)                    bool
+    is_terminal (T,)                    bool
+
+Pixels are P1-perspective as collected (no side-canonicalization — the
+frame is a rendered image, not a symmetric state vector), so an image
+world model trained here is tied to the collecting player's viewpoint.
 """
 
 from __future__ import annotations
@@ -34,8 +49,38 @@ from leworldgaming.env.state_vector import (
 )
 
 # Bumped when the on-disk npz layout changes — old caches get rebuilt instead
-# of silently feeding stale shapes into the trainer.
-_EXPORT_SCHEMA = "vector_v1"
+# of silently feeding stale shapes into the trainer. One marker per obs mode so
+# vector and image caches never clobber each other.
+_EXPORT_SCHEMA = {
+    "vector": "vector_v1",
+    "image": "image_v1",
+}
+
+# Default edge length for the CNN-mode image. DreamerV3's ConvEncoder needs a
+# power-of-two side (stages = log2(size) - log2(minres=4)); 64 → 4 stages,
+# matching the upstream ``dmc_vision`` config.
+_DEFAULT_IMAGE_SIZE = 64
+
+
+def _downsample_pixels(px_chw: np.ndarray, image_size: int) -> np.ndarray:
+    """``(T, C, H, W) uint8`` → ``(T, image_size, image_size, C) uint8`` (HWC).
+
+    DreamerV3's ``ConvEncoder.forward`` expects images laid out as
+    ``(batch, time, h, w, ch)`` and permutes to CHW internally
+    (``external/dreamerv3-torch/networks.py``). The replay buffer stores
+    pixels CHW at 224², so we transpose to HWC and area-resize down to
+    ``image_size`` per frame (INTER_AREA is the correct downsampling filter).
+    """
+    import cv2
+
+    t, c, h, w = px_chw.shape
+    out = np.empty((t, image_size, image_size, c), dtype=np.uint8)
+    for i in range(t):
+        hwc = np.ascontiguousarray(px_chw[i].transpose(1, 2, 0))  # CHW -> HWC
+        if (h, w) != (image_size, image_size):
+            hwc = cv2.resize(hwc, (image_size, image_size), interpolation=cv2.INTER_AREA)
+        out[i] = hwc
+    return out
 
 
 def _episode_slices(episode_starts: np.ndarray, n_total: int) -> list[tuple[int, int]]:
@@ -73,15 +118,25 @@ def export_episodes_to_npz(
     out_dir: str | Path,
     action_dim: int = NUM_ACTIONS,
     overwrite: bool = False,
+    obs_mode: str = "vector",
+    image_size: int = _DEFAULT_IMAGE_SIZE,
 ) -> int:
     """Slice HDF5 replay file(s) into per-episode npz files. Returns number written.
 
     ``data_path`` may be a single ``.h5`` file or a directory of them.
 
+    ``obs_mode`` selects the exported layout: ``"vector"`` (proprio, default)
+    or ``"image"`` (full pixels down-sampled to ``image_size``²). Each mode
+    has its own schema marker so caches never mix.
+
     Cache invalidation: writes a small ``_EXPORT_SCHEMA`` marker. If the
     marker is missing or stale and ``out_dir`` already has npz files,
     re-export. Otherwise skip silently.
     """
+    if obs_mode not in _EXPORT_SCHEMA:
+        raise ValueError(f"obs_mode must be one of {sorted(_EXPORT_SCHEMA)}, got {obs_mode!r}")
+    schema = _EXPORT_SCHEMA[obs_mode]
+
     h5_paths = _resolve_h5_paths(data_path)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -90,15 +145,15 @@ def export_episodes_to_npz(
     existing_marker = marker.read_text().strip() if marker.exists() else ""
     has_episodes = any(out_dir.glob("*.npz"))
 
-    if has_episodes and existing_marker == _EXPORT_SCHEMA and not overwrite:
+    if has_episodes and existing_marker == schema and not overwrite:
         existing = len(list(out_dir.glob("*.npz")))
         print(f"[dreamer_export] {out_dir} already has {existing} episodes "
-              f"(schema={_EXPORT_SCHEMA}) — skip")
+              f"(schema={schema}) — skip")
         return existing
 
-    if has_episodes and existing_marker != _EXPORT_SCHEMA:
+    if has_episodes and existing_marker != schema:
         print(f"[dreamer_export] cache schema mismatch "
-              f"('{existing_marker}' != '{_EXPORT_SCHEMA}') — clearing {out_dir}")
+              f"('{existing_marker}' != '{schema}') — clearing {out_dir}")
         for p in out_dir.glob("*.npz"):
             p.unlink()
 
@@ -111,7 +166,14 @@ def export_episodes_to_npz(
             episode_starts = f["episode_starts"][:]
             slices = _episode_slices(episode_starts, n)
             print(f"[dreamer_export] {h5_path}: {n} steps, {len(slices)} episodes "
-                  f"(state_dim={DREAMER_STATE_DIM})")
+                  f"(obs_mode={obs_mode}"
+                  f"{f', img={image_size}' if obs_mode == 'image' else f', state_dim={DREAMER_STATE_DIM}'})")
+
+            if obs_mode == "image" and "pixels" not in f:
+                raise KeyError(
+                    f"{h5_path} has no 'pixels' dataset — image-mode Dreamer needs "
+                    "pixel data. Re-collect with pixels enabled (BufferConfig.pixel_shape)."
+                )
 
             action_arr = f["action"][:]
             reward_arr = f["reward"][:]
@@ -122,11 +184,6 @@ def export_episodes_to_npz(
                 length = b - a
                 if length < 2:
                     continue
-
-                ep_primitives = _read_episode_arrays(f, a, b)
-                ep_primitives = {k: v[None, :] for k, v in ep_primitives.items()}
-                ep_primitives = canonicalize_sample(ep_primitives)
-                vector = _build_dreamer_vector(ep_primitives)[0]
 
                 actions_int = action_arr[a:b].astype(np.int64)
                 action_oh = np.zeros((length, action_dim), dtype=np.float32)
@@ -139,18 +196,28 @@ def export_episodes_to_npz(
                 is_terminal[-1] = True
 
                 ep = {
-                    "vector": vector.astype(np.float32),
-                    "image": np.zeros((length, 1, 1, 3), dtype=np.uint8),
                     "action": action_oh,
                     "reward": reward_arr[a:b].astype(np.float32),
                     "is_first": is_first,
                     "is_terminal": is_terminal,
                 }
+
+                if obs_mode == "image":
+                    px = f["pixels"][a:b]  # (length, C, H, W) uint8
+                    ep["image"] = _downsample_pixels(px, image_size)
+                else:
+                    ep_primitives = _read_episode_arrays(f, a, b)
+                    ep_primitives = {k: v[None, :] for k, v in ep_primitives.items()}
+                    ep_primitives = canonicalize_sample(ep_primitives)
+                    vector = _build_dreamer_vector(ep_primitives)[0]
+                    ep["vector"] = vector.astype(np.float32)
+                    ep["image"] = np.zeros((length, 1, 1, 3), dtype=np.uint8)
+
                 filename = out_dir / f"ep{global_ep_idx:06d}-{length}.npz"
                 np.savez_compressed(filename, **ep)
                 n_written += 1
                 global_ep_idx += 1
 
-    marker.write_text(_EXPORT_SCHEMA)
+    marker.write_text(schema)
     print(f"[dreamer_export] wrote {n_written} episodes total from {len(h5_paths)} file(s)")
     return n_written

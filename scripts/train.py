@@ -42,6 +42,8 @@ def main() -> None:
                         help="LeWM: cap validation batches per eval (0 = full val set).")
     parser.add_argument("--ckpt-every", type=int, default=None,
                         help="LeWM Stage A: save a checkpoint every N steps (0 disables periodic saves).")
+    parser.add_argument("--resume", action="store_true", default=None,
+                        help="LeWM Stage A: resume from --ckpt-path if it exists; --steps is the TOTAL target.")
     args = parser.parse_args()
 
     overrides = {
@@ -54,6 +56,7 @@ def main() -> None:
         "val_every": args.val_every,
         "val_batches": args.val_batches,
         "ckpt_every": args.ckpt_every,
+        "resume": args.resume,
     }
 
     if args.agent == "lewm" and args.stage == "b":

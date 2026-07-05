@@ -94,6 +94,9 @@ DEFAULTS: dict[str, Any] = {
     "val_batches": 8,
     "ckpt_every": 1000,
     "seed": 0,
+    # Resume: if True and ckpt_path exists, load weights + optimizer state and
+    # continue from the saved step. num_steps is treated as the TOTAL target.
+    "resume": False,
 }
 
 
@@ -190,7 +193,36 @@ def train(
         weight_decay=float(cfg["weight_decay"]),
     )
 
+    # Optional resume: load weights + optimizer state and continue from the
+    # saved step. num_steps is the TOTAL target, so re-running the same command
+    # with a higher --steps extends training; an equal --steps is a no-op.
+    ckpt_path = Path(cfg["ckpt_path"])
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    start_step = 0
+    if bool(cfg.get("resume", False)) and ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        encoder.load_state_dict(ckpt["encoder"])
+        projector.load_state_dict(ckpt["projector"])
+        action_encoder.load_state_dict(ckpt["action_encoder"])
+        predictor.load_state_dict(ckpt["predictor"])
+        pred_proj.load_state_dict(ckpt["pred_proj"])
+        if "optim" in ckpt:
+            optim.load_state_dict(ckpt["optim"])
+        start_step = int(ckpt.get("num_steps", 0))
+        print(
+            f"[train_lewm] resumed from {ckpt_path} at step={start_step} "
+            f"-> training to {num_steps}"
+        )
+        if start_step >= num_steps:
+            print(
+                f"[train_lewm] nothing to do: start_step ({start_step}) >= "
+                f"num_steps ({num_steps}). Raise --steps to continue."
+            )
+    elif bool(cfg.get("resume", False)):
+        print(f"[train_lewm] --resume set but no checkpoint at {ckpt_path} — starting fresh")
+
     rng = np.random.default_rng(int(cfg["seed"]))
+
     sigreg_lambda = float(cfg["sigreg_lambda"])
     grad_clip = float(cfg["grad_clip"])
     log_every = int(cfg["log_every"])
@@ -198,8 +230,6 @@ def train(
     batch_size = int(cfg["batch_size"])
     action_dim = int(cfg["action_dim"])
     ckpt_every = int(cfg.get("ckpt_every", 0) or 0)
-    ckpt_path = Path(cfg["ckpt_path"])
-    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _save_ckpt(step_done: int, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -292,7 +322,7 @@ def train(
 
         t0 = time.time()
         modules.train()
-        for step in range(num_steps):
+        for step in range(start_step, num_steps):
             batch = reader.sample_window(
                 train_starts, batch_size, seq_len, rng
             )
@@ -343,9 +373,14 @@ def train(
                 print(f"[train_lewm] step={step:5d}  saved checkpoint -> {ckpt_path}")
 
         elapsed = time.time() - t0
-        print(f"[train_lewm] done in {elapsed:.1f}s ({num_steps / elapsed:.1f} step/s)")
+        steps_run = max(num_steps - start_step, 0)
+        rate = steps_run / elapsed if elapsed > 0 else 0.0
+        print(f"[train_lewm] done in {elapsed:.1f}s ({rate:.1f} step/s, {steps_run} steps)")
 
-    _save_ckpt(num_steps, ckpt_path)
+    # Save with the highest step count reached, so a no-op resume (start_step >=
+    # num_steps) never regresses the checkpoint's recorded progress.
+    steps_done = max(start_step, num_steps)
+    _save_ckpt(steps_done, ckpt_path)
     print(f"[train_lewm] saved checkpoint -> {ckpt_path}")
 
     return {
