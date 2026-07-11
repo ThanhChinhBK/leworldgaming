@@ -90,7 +90,10 @@ DEFAULTS: dict[str, Any] = {
     "ckpt_out": "data/lewm_heads_checkpoint.pt",
     "log_every": 10,
     "val_split": 0.1,
-    "val_every": 25,
+    "val_every": 1000,
+    "val_batches": 8,
+    "ckpt_every": 1000,
+    "resume": False,  # resume from ckpt_out if it exists; --steps is the TOTAL target
     "seed": 0,
 }
 
@@ -256,10 +259,42 @@ def train(
         weight_decay=float(cfg["weight_decay"]),
     )
 
+    # Optional resume: load heads + optimizer state and continue from the
+    # saved step. num_steps is the TOTAL target, so re-running the same command
+    # with a higher --steps extends training; an equal --steps is a no-op.
+    # NOTE: resuming reloads the heads (not the frozen JEPA, which always comes
+    # fresh from --ckpt-in) — it is meant to extend an interrupted Stage-B run
+    # for the SAME milestone config, not to switch milestones mid-run.
+    ckpt_out = Path(cfg["ckpt_out"])
+    ckpt_out.parent.mkdir(parents=True, exist_ok=True)
+    start_step = 0
+    if bool(cfg.get("resume", False)) and ckpt_out.exists():
+        prev_ckpt = torch.load(ckpt_out, map_location=device, weights_only=False)
+        reward_head.load_state_dict(prev_ckpt["reward_head"])
+        continuation_head.load_state_dict(prev_ckpt["continuation_head"])
+        value_head.load_state_dict(prev_ckpt["value_head"])
+        value_target_head.load_state_dict(prev_ckpt["value_target_head"])
+        probe.load_state_dict(prev_ckpt["probe"])
+        if "optim" in prev_ckpt:
+            optim.load_state_dict(prev_ckpt["optim"])
+        start_step = int(prev_ckpt.get("num_steps", 0))
+        print(
+            f"[train_lewm_heads] resumed from {ckpt_out} at step={start_step} "
+            f"-> training to {num_steps}"
+        )
+        if start_step >= num_steps:
+            print(
+                f"[train_lewm_heads] nothing to do: start_step ({start_step}) >= "
+                f"num_steps ({num_steps}). Raise --steps to continue."
+            )
+    elif bool(cfg.get("resume", False)):
+        print(f"[train_lewm_heads] --resume set but no checkpoint at {ckpt_out} — starting fresh")
+
     rng = np.random.default_rng(int(cfg["seed"]))
     grad_clip = float(cfg["grad_clip"])
     log_every = int(cfg["log_every"])
     val_every = int(cfg["val_every"])
+    ckpt_every = int(cfg.get("ckpt_every", 0) or 0)
     batch_size = int(cfg["batch_size"])
     w_r = float(hcfg["reward_loss_weight"])
     w_c = float(hcfg["cont_loss_weight"])
@@ -452,6 +487,9 @@ def train(
             losses_c_im: list[float] = []
             losses_probe: list[float] = []
             n_batches = max(1, val_starts.size // batch_size)
+            val_batches = int(cfg.get("val_batches", 0) or 0)
+            if val_batches > 0:
+                n_batches = min(n_batches, val_batches)
             val_rng = np.random.default_rng(12345)
             for _ in range(n_batches):
                 pixels, a_oh, rewards, dones, state_vec = _make_batch(val_starts, val_rng)
@@ -472,9 +510,37 @@ def train(
                 "val_loss_probe": float(np.mean(losses_probe)),
             }
 
+        def _save_ckpt(step_done: int, dest: Path) -> None:
+            """Atomic save (write to a temp file then rename) so a kill mid-write
+            never corrupts the last good checkpoint."""
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_suffix(dest.suffix + ".tmp")
+            torch.save(
+                {
+                    # Re-save Stage-A weights so this checkpoint is self-contained.
+                    "encoder": ckpt_in["encoder"],
+                    "projector": ckpt_in["projector"],
+                    "action_encoder": ckpt_in["action_encoder"],
+                    "predictor": ckpt_in["predictor"],
+                    "pred_proj": ckpt_in["pred_proj"],
+                    "reward_head": reward_head.state_dict(),
+                    "continuation_head": continuation_head.state_dict(),
+                    "value_head": value_head.state_dict(),
+                    "value_target_head": value_target_head.state_dict(),
+                    "probe": probe.state_dict(),
+                    "optim": optim.state_dict(),
+                    "config": jepa["_arch"],
+                    "heads_config": hcfg,
+                    "stage": "B",
+                    "num_steps": step_done,
+                },
+                tmp,
+            )
+            tmp.replace(dest)
+
         t0 = time.time()
         head_modules.train()
-        for step in range(num_steps):
+        for step in range(start_step, num_steps):
             pixels, a_oh, rewards, dones, state_vec = _make_batch(train_starts, rng)
 
             with amp_autocast(device):
@@ -521,29 +587,14 @@ def train(
                     f"probe={vm['val_loss_probe']:.4f}"
                 )
 
+            if ckpt_every > 0 and step > 0 and step % ckpt_every == 0:
+                _save_ckpt(step, ckpt_out)
+                print(f"[train_lewm_heads] step={step:5d}  saved checkpoint -> {ckpt_out}")
+
         elapsed = time.time() - t0
         print(f"[train_lewm_heads] done in {elapsed:.1f}s ({num_steps / elapsed:.1f} step/s)")
 
-    ckpt_out = Path(cfg["ckpt_out"])
-    ckpt_out.parent.mkdir(parents=True, exist_ok=True)
-    save_dict: dict[str, Any] = {
-        # Re-save Stage-A weights so this checkpoint is self-contained for inference.
-        "encoder": ckpt_in["encoder"],
-        "projector": ckpt_in["projector"],
-        "action_encoder": ckpt_in["action_encoder"],
-        "predictor": ckpt_in["predictor"],
-        "pred_proj": ckpt_in["pred_proj"],
-        "reward_head": reward_head.state_dict(),
-        "continuation_head": continuation_head.state_dict(),
-        "value_head": value_head.state_dict(),
-        "value_target_head": value_target_head.state_dict(),
-        "probe": probe.state_dict(),
-        "config": jepa["_arch"],
-        "heads_config": hcfg,
-        "stage": "B",
-        "num_steps": num_steps,
-    }
-    torch.save(save_dict, ckpt_out)
+    _save_ckpt(num_steps, ckpt_out)
     print(f"[train_lewm_heads] saved checkpoint -> {ckpt_out}")
 
     return {

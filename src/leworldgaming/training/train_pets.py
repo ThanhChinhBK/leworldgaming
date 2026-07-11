@@ -53,6 +53,9 @@ DEFAULTS: dict[str, Any] = {
     "log_every": 10,
     "val_split": 0.1,
     "val_every": 25,
+    "val_batches": 8,
+    "ckpt_every": 1000,  # save a checkpoint every N steps (0 = only at end)
+    "resume": False,  # resume from ckpt_path if it exists; --steps is the TOTAL target
     "seed": 0,
 }
 
@@ -107,6 +110,45 @@ def train(
         weight_decay=float(cfg["weight_decay"]),
     )
 
+    # Optional resume: load weights + optimizer state and continue from the
+    # saved step. num_steps is the TOTAL target, so re-running the same command
+    # with a higher --steps extends training; an equal --steps is a no-op.
+    ckpt_path = Path(cfg["ckpt_path"])
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_every = int(cfg.get("ckpt_every", 0) or 0)
+    start_step = 0
+    if bool(cfg.get("resume", False)) and ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        agent.dynamics.load_state_dict(ckpt["dynamics"])
+        if "optim" in ckpt:
+            optim.load_state_dict(ckpt["optim"])
+        start_step = int(ckpt.get("num_steps", 0))
+        print(
+            f"[train_pets] resumed from {ckpt_path} at step={start_step} "
+            f"-> training to {num_steps}"
+        )
+        if start_step >= num_steps:
+            print(
+                f"[train_pets] nothing to do: start_step ({start_step}) >= "
+                f"num_steps ({num_steps}). Raise --steps to continue."
+            )
+    elif bool(cfg.get("resume", False)):
+        print(f"[train_pets] --resume set but no checkpoint at {ckpt_path} — starting fresh")
+
+    def _save_ckpt(step_done: int, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        torch.save(
+            {
+                "dynamics": agent.dynamics.state_dict(),
+                "optim": optim.state_dict(),
+                "config": cfg,
+                "num_steps": step_done,
+            },
+            tmp,
+        )
+        tmp.replace(dest)
+
     rng = np.random.default_rng(int(cfg["seed"]))
     grad_clip = float(cfg["grad_clip"])
     log_every = int(cfg["log_every"])
@@ -137,6 +179,9 @@ def train(
             agent.dynamics.eval()
             mses: list[float] = []
             n_batches = max(1, val_starts.size // batch_size)
+            val_batches = int(cfg.get("val_batches", 0) or 0)
+            if val_batches > 0:
+                n_batches = min(n_batches, val_batches)
             val_rng = np.random.default_rng(12345)
             for _ in range(n_batches):
                 batch = _sample_transition_batch(
@@ -151,7 +196,7 @@ def train(
             return {"val_delta_mse": float(np.mean(mses))}
 
         t0 = time.time()
-        for step in range(num_steps):
+        for step in range(start_step, num_steps):
             batch = _sample_transition_batch(reader, train_starts, batch_size, rng, max_hp)
             metrics = agent.learn(batch)
             loss = metrics["loss"]
@@ -186,22 +231,17 @@ def train(
                 val_history.append(vm)
                 print(f"[train_pets] step={step:5d}  val  mse={vm['val_delta_mse']:.4f}")
 
+            if ckpt_every > 0 and step > 0 and step % ckpt_every == 0:
+                _save_ckpt(step, ckpt_path)
+                print(f"[train_pets] checkpoint saved -> {ckpt_path} (step={step})")
+
         elapsed = time.time() - t0
         print(f"[train_pets] done in {elapsed:.1f}s ({num_steps / max(elapsed, 1e-9):.1f} step/s)")
 
     finally:
         reader.close()
 
-    ckpt_path = Path(cfg["ckpt_path"])
-    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "dynamics": agent.dynamics.state_dict(),
-            "config": cfg,
-            "num_steps": num_steps,
-        },
-        ckpt_path,
-    )
+    _save_ckpt(num_steps, ckpt_path)
     print(f"[train_pets] saved checkpoint -> {ckpt_path}")
 
     return {

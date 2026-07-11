@@ -41,9 +41,12 @@ def main() -> None:
     parser.add_argument("--val-batches", type=int, default=None,
                         help="LeWM: cap validation batches per eval (0 = full val set).")
     parser.add_argument("--ckpt-every", type=int, default=None,
-                        help="LeWM Stage A: save a checkpoint every N steps (0 disables periodic saves).")
+                        help="Save a checkpoint every N steps (0 disables periodic saves). "
+                             "Supported by lewm (stage a/b), dreamer, and pets.")
     parser.add_argument("--resume", action="store_true", default=None,
-                        help="LeWM Stage A: resume from --ckpt-path if it exists; --steps is the TOTAL target.")
+                        help="Resume from the existing checkpoint (Stage A: --ckpt-path, "
+                             "Stage B: --ckpt-in/config ckpt_out, dreamer/pets: --ckpt-path) "
+                             "if present; --steps is the TOTAL target step count.")
     args = parser.parse_args()
 
     overrides = {
@@ -65,7 +68,6 @@ def main() -> None:
         # Stage B uses ckpt_in / ckpt_out, not the Stage-A ckpt_path.
         overrides.pop("sigreg_lambda", None)
         overrides.pop("ckpt_path", None)
-        overrides.pop("ckpt_every", None)
         if args.ckpt_in is not None:
             overrides["ckpt_in"] = args.ckpt_in
         if args.ckpt_path is not None:
@@ -83,14 +85,12 @@ def main() -> None:
         # Dreamer doesn't use sigreg_lambda; drop it to avoid a stray override.
         overrides.pop("sigreg_lambda", None)
         overrides.pop("lr", None)  # use model_lr / actor_lr / critic_lr instead
-        overrides.pop("ckpt_every", None)
         train(num_steps=args.steps,
               config_path=args.config or "configs/dreamer.yaml", **overrides)
     else:  # pets
         from leworldgaming.training.train_pets import train
 
         overrides.pop("sigreg_lambda", None)
-        overrides.pop("ckpt_every", None)
         train(num_steps=args.steps,
               config_path=args.config or "configs/pets.yaml", **overrides)
 

@@ -382,6 +382,12 @@ class ReplayBuffer:
         assert self._f is not None
         if self._episode_start == self._n:
             return
+        # Mark the true terminal frame: processing() always writes done=False
+        # since it can't know in advance which frame is last, so patch the
+        # final frame of this just-ended episode here instead.
+        last_idx = self._n - 1
+        self._f["done"][last_idx] = np.uint8(1)
+        self._f["cont"][last_idx] = np.uint8(0)
         starts = self._f["episode_starts"]
         starts.resize((self._n_episodes + 1,))
         starts[self._n_episodes] = self._episode_start
@@ -450,8 +456,12 @@ def valid_seq_starts(f: h5py.File, seq_len: int) -> np.ndarray:
     valid = np.ones(candidates.size, dtype=bool)
     for k in range(seq_len):
         idx = candidates + k
-        valid &= dones[idx] == 0
+        # The window's LAST position is allowed to be a terminal frame (that's
+        # the whole point of training on episode-ending transitions) — only
+        # earlier positions must not be terminal/episode-final, otherwise the
+        # window would silently cross into the next episode.
         if k < seq_len - 1:
+            valid &= dones[idx] == 0
             valid &= ~is_last[idx]
     return candidates[valid]
 

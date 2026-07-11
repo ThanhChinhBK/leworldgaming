@@ -31,4 +31,6 @@ ckpt_path: data/pets_checkpoint.pt
 log_every: 10
 val_split: 0.1
 val_every: 25
+val_batches: 8
+ckpt_every: 1000      # save a checkpoint every N steps (0 = only at end)
 seed: 0

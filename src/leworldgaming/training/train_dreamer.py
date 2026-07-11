@@ -61,6 +61,8 @@ DEFAULTS: dict[str, Any] = {
     "imag_horizon": 15,
     "log_every": 10,
     "val_every": 0,  # offline pretraining doesn't have a held-out env
+    "ckpt_every": 1000,  # save a checkpoint every N steps (0 = only at end)
+    "resume": False,  # resume from ckpt_path if it exists; --steps is the TOTAL target
     "seed": 0,
     # Behaviour modifiers
     "compile": False,  # disable torch.compile by default — flaky on MPS
@@ -240,11 +242,54 @@ def train(
 
     agent = DreamerAgent(agent_module, dreamer_cfg, device)
 
+    # Optional resume: load weights + optimizer state and continue from the
+    # saved step. num_steps is the TOTAL target, so re-running the same command
+    # with a higher --steps extends training; an equal --steps is a no-op.
+    ckpt_path = Path(cfg["ckpt_path"])
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_every = int(cfg.get("ckpt_every", 0) or 0)
+    start_step = 0
+    if bool(cfg.get("resume", False)) and ckpt_path.exists():
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        agent_module.load_state_dict(ckpt["agent_state_dict"])
+        if "optims_state_dict" in ckpt:
+            dreamer_tools.recursively_load_optim_state_dict(
+                agent_module, ckpt["optims_state_dict"]
+            )
+        start_step = int(ckpt.get("num_steps", 0))
+        print(
+            f"[train_dreamer] resumed from {ckpt_path} at step={start_step} "
+            f"-> training to {num_steps}"
+        )
+        if start_step >= num_steps:
+            print(
+                f"[train_dreamer] nothing to do: start_step ({start_step}) >= "
+                f"num_steps ({num_steps}). Raise --steps to continue."
+            )
+    elif bool(cfg.get("resume", False)):
+        print(f"[train_dreamer] --resume set but no checkpoint at {ckpt_path} — starting fresh")
+
+    def _save_ckpt(step_done: int, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        torch.save(
+            {
+                "agent_state_dict": agent_module.state_dict(),
+                "optims_state_dict": dreamer_tools.recursively_collect_optim_state_dict(
+                    agent_module
+                ),
+                "config": cfg,
+                "num_steps": step_done,
+            },
+            tmp,
+        )
+        tmp.replace(dest)
+
     # 3. Train.
     log_every = int(cfg["log_every"])
     history: list[dict[str, float]] = []
     t0 = time.time()
-    for step in range(num_steps):
+    for step in range(start_step, num_steps):
         batch = next(train_dataset)
         metrics = agent.learn(batch)
         metrics["step"] = step
@@ -256,21 +301,15 @@ def train(
             ) if k in metrics}
             shown_str = " ".join(f"{k}={v:.4f}" for k, v in shown.items())
             print(f"[train_dreamer] step={step:5d} {shown_str}")
+        if ckpt_every > 0 and step > 0 and step % ckpt_every == 0:
+            _save_ckpt(step, ckpt_path)
+            print(f"[train_dreamer] checkpoint saved -> {ckpt_path} (step={step})")
 
     elapsed = time.time() - t0
     print(f"[train_dreamer] done in {elapsed:.1f}s ({num_steps / max(elapsed, 1e-9):.1f} step/s)")
 
     # 4. Save.
-    ckpt_path = Path(cfg["ckpt_path"])
-    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "agent_state_dict": agent_module.state_dict(),
-            "config": cfg,
-            "num_steps": num_steps,
-        },
-        ckpt_path,
-    )
+    _save_ckpt(num_steps, ckpt_path)
     print(f"[train_dreamer] saved checkpoint -> {ckpt_path}")
 
     return {

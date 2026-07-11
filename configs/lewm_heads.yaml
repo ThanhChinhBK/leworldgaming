@@ -10,15 +10,15 @@ heads:
   value_low: -10.0
   value_high: 10.0
   hidden_dim: 512
-  imagined_horizon: 0     # M2: encoder-grounded only. M4 will bump this to 5.
+  imagined_horizon: 5      # M4: enabled.
   lambda_return: 0.95
   gamma: 0.997
   target_ema: 0.99
   reward_loss_weight: 1.0
   cont_loss_weight: 1.0
-  value_loss_weight: 0.0  # M2: disabled. M3 will set to 0.5.
-  imagined_loss_weight: 0.0  # M2: disabled.
-  probe_loss_weight: 0.0  # M2: disabled. M5 will enable.
+  value_loss_weight: 0.5  # M3: enabled.
+  imagined_loss_weight: 1.0  # M4: enabled.
+  probe_loss_weight: 0.1  # M5: enabled.
 
 # Optimization (separate from Stage-A optimizer)
 batch_size: 16
@@ -27,10 +27,12 @@ weight_decay: 1.0e-3
 grad_clip: 1.0
 
 # I/O
-data_path: data/replay.h5
+data_path: /media/jeovach/New Volume/leworldgaming
 ckpt_in: data/lewm_checkpoint.pt
 ckpt_out: data/lewm_heads_checkpoint.pt
 log_every: 10
 val_split: 0.1
-val_every: 25
+val_every: 1000
+val_batches: 8
+ckpt_every: 1000      # save a checkpoint every N steps (0 = only at end)
 seed: 0

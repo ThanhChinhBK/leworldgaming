@@ -17,6 +17,7 @@ actor_lr: 3.0e-5
 critic_lr: 3.0e-5
 imag_horizon: 15
 log_every: 10
+ckpt_every: 1000      # save a checkpoint every N steps (0 = only at end)
 seed: 0
 
 # Behaviour modifiers
