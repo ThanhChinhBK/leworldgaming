@@ -4,6 +4,16 @@ action_dim: 56
 projector_hidden: 2048
 history_size: 3
 
+# Temporal frameskip (a.k.a. "step" in the LeWM paper): number of raw
+# environment frames per training step. The original LeWM paper uses
+# frameskip=5 for both data + planning; this repo previously used stride=1,
+# meaning its 5-step planning horizon only covered 5 raw frames (~83ms at
+# 60fps) instead of the paper's 25 raw frames (~417ms) — too short to see
+# most special-attack startup/active windows. stride=5 matches the paper:
+# each step's observation is the frame at the block's start, and its action
+# is the concatenation of all 5 raw one-hot actions inside the block.
+temporal_stride: 5
+
 # Encoder (ViT-tiny: depth=12, dim=192, heads=3, mlp_ratio=4).
 # Drop encoder_depth to 6 for fast MPS iteration.
 encoder_image_size: 224
@@ -37,12 +47,16 @@ data_path: data/replay.h5
 ckpt_path: data/lewm_checkpoint.pt
 log_every: 10
 val_split: 0.1
-val_every: 25
+val_every: 1000
 val_batches: 8        # cap validation batches per eval (0 = full val set)
 ckpt_every: 1000      # save a checkpoint every N steps (0 = only at end)
 seed: 0
 
 # Inference-time planner (not used by train_lewm.py)
+# NOTE: with temporal_stride=5 above, planner.horizon=5 steps now covers
+# 5*5=25 raw frames (~417ms) — matching the paper's real-time lookahead.
+# planner.py / play.py still need to be updated separately to hold each
+# planned action for `temporal_stride` raw frames at rollout time.
 planner:
   horizon: 5
   num_samples: 64

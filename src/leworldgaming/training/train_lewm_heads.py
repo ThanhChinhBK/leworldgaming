@@ -53,6 +53,7 @@ from leworldgaming.agents.lewm.twohot import make_bins, twohot_ce_loss, twohot_d
 from leworldgaming.agents.lewm.value_head import ValueHead
 from leworldgaming.data.replay_buffer import DataReader
 from leworldgaming.training._replay_utils import (
+    reduce_reward_seq,
     to_device_seq,
 )
 from leworldgaming.utils.device import amp_autocast, best_device
@@ -125,6 +126,7 @@ def _build_jepa_from_ckpt(ckpt: dict[str, Any], device: torch.device) -> dict[st
     history_size = int(arch["history_size"])
     latent_dim = int(arch["latent_dim"])
     action_dim = int(arch["action_dim"])
+    temporal_stride = int(arch.get("temporal_stride", 1) or 1)
     projector_hidden = int(arch["projector_hidden"])
 
     encoder = Encoder(
@@ -138,7 +140,10 @@ def _build_jepa_from_ckpt(ckpt: dict[str, Any], device: torch.device) -> dict[st
         dropout=float(arch["encoder_dropout"]),
     ).to(device)
     projector = Projector(latent_dim=latent_dim, hidden_dim=projector_hidden).to(device)
-    action_encoder = ActionEncoder(action_dim=action_dim, emb_dim=latent_dim).to(device)
+    # ActionEncoder's input width is `action_dim * temporal_stride` (matches
+    # how train_lewm.py builds it) — `action_dim` here stays the RAW one-hot
+    # count so callers can still one-hot raw per-frame actions correctly.
+    action_encoder = ActionEncoder(action_dim=action_dim * temporal_stride, emb_dim=latent_dim).to(device)
     predictor = Predictor(
         latent_dim=latent_dim,
         action_dim=latent_dim,
@@ -172,6 +177,7 @@ def _build_jepa_from_ckpt(ckpt: dict[str, Any], device: torch.device) -> dict[st
         "_history_size": history_size,
         "_latent_dim": latent_dim,
         "_action_dim": action_dim,
+        "_temporal_stride": temporal_stride,
     }
 
 
@@ -209,10 +215,17 @@ def train(
     history_size: int = jepa["_history_size"]
     latent_dim: int = jepa["_latent_dim"]
     action_dim: int = jepa["_action_dim"]
+    stride: int = jepa["_temporal_stride"]
     imagined_horizon = int(hcfg["imagined_horizon"])
     # Window covers `history_size` real frames + `imagined_horizon` rolled
     # positions (+1 for the encoder-grounded last position when K=0).
     seq_len = history_size + max(1, imagined_horizon)
+    # When stride>1 the action/reward at position T-1 needs raw frames one
+    # block beyond the observed span (see replay_buffer._RAW_STRIDE_KEYS), so
+    # we fetch one extra observed frame purely to derive that last action
+    # block, then trim pixels/dones/state_vec back down to `seq_len` before
+    # use. At stride=1 this is a no-op (window_len == seq_len).
+    window_len = seq_len + (1 if stride > 1 else 0)
 
     reward_head = RewardHead(
         latent_dim=latent_dim,
@@ -443,7 +456,7 @@ def train(
             p_tgt.data.mul_(target_ema).add_(p.data, alpha=1.0 - target_ema)
 
     with DataReader(cfg["data_path"]) as reader:
-        valid_starts = reader.valid_seq_starts(seq_len)
+        valid_starts = reader.valid_seq_starts(window_len, stride=stride)
         if valid_starts.size == 0:
             raise RuntimeError("No valid sequences in replay buffer.")
 
@@ -455,7 +468,7 @@ def train(
         print(
             f"[train_lewm_heads] files={reader.num_files} frames={reader.total_frames} "
             f"valid_seq_starts={n} train={train_starts.size} val={val_starts.size} "
-            f"episodes={reader.total_episodes}"
+            f"episodes={reader.total_episodes} temporal_stride={stride}"
         )
 
         # Probe needs state_vector; only fetch it if enabled and available.
@@ -467,14 +480,24 @@ def train(
             starts, batch_rng: np.random.Generator
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
             batch = reader.sample_window(
-                starts, batch_size, seq_len, batch_rng, extra_keys=extra_keys
+                starts, batch_size, window_len, batch_rng, extra_keys=extra_keys, stride=stride
             )
-            pixels, a_oh = to_device_seq(batch["pixels"], batch["action"], action_dim, device)
-            rewards = torch.from_numpy(batch["reward"]).to(device, dtype=torch.float32)
+            pixels, a_oh = to_device_seq(
+                batch["pixels"], batch["action"], action_dim, device, stride=stride
+            )
+            rewards_raw = torch.from_numpy(batch["reward"]).to(device, dtype=torch.float32)
+            rewards = reduce_reward_seq(rewards_raw, stride)
             dones = torch.from_numpy(batch["done"]).to(device, dtype=torch.float32)
             state_vec: torch.Tensor | None = None
             if "state_vector" in batch:
                 state_vec = torch.from_numpy(batch["state_vector"]).to(device, dtype=torch.float32)
+            # pixels/dones/state_vec were fetched at `window_len` (one extra
+            # frame when stride>1, purely to derive the last action/reward
+            # block) — trim back down to `seq_len` so every tensor lines up.
+            pixels = pixels[:, :seq_len]
+            dones = dones[:, :seq_len]
+            if state_vec is not None:
+                state_vec = state_vec[:, :seq_len]
             return pixels, a_oh, rewards, dones, state_vec
 
         @torch.no_grad()

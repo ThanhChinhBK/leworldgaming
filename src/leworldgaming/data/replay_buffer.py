@@ -441,45 +441,89 @@ class ReplayBuffer:
 # --------------------------------------------------------------------------- #
 
 
-def valid_seq_starts(f: h5py.File, seq_len: int) -> np.ndarray:
-    """Indices ``i`` such that ``[i, i+seq_len-1]`` lies within one episode and
-    contains no terminal frames before the last position. Replaces
-    ``train_lewm._valid_seq_start_indices`` and now serves all trainers."""
+# Keys that must be read as the FULL raw (un-subsampled) span rather than
+# subsampled at ``stride`` when ``stride > 1`` (temporal frameskip):
+#   - "action": the AR predictor/heads need every raw action taken during a
+#     stride block (not just the action at the sampled frame), so callers can
+#     concatenate them into one ``stride * action_dim``-wide vector per step
+#     (matches the original LeWM paper's ``effective_act_dim = frameskip *
+#     action_dim`` convention).
+#   - "reward": a step's reward under frameskip is the SUM of the raw rewards
+#     earned across the block, not just the reward at the sampled frame.
+# Every other column (pixels, done, cont, state_vector, obs/* groups, ...)
+# represents an instantaneous observation, so it's fine to just take the
+# frame at each block boundary (plain subsampling).
+_RAW_STRIDE_KEYS = frozenset({"action", "reward"})
+
+
+def valid_seq_starts(f: h5py.File, seq_len: int, stride: int = 1) -> np.ndarray:
+    """Indices ``i`` such that the raw span ``[i, i+(seq_len-1)*stride]`` lies
+    within one episode and contains no terminal frames before the last raw
+    position. Replaces ``train_lewm._valid_seq_start_indices`` and now serves
+    all trainers.
+
+    ``stride`` (a.k.a. frameskip/temporal_stride) is the number of raw frames
+    per training "step" — ``seq_len`` steps then span
+    ``(seq_len - 1) * stride + 1`` raw frames. ``stride=1`` (default) is the
+    original unstrided behavior.
+    """
     n = f["action"].shape[0]
+    span = (seq_len - 1) * stride + 1
     starts = f["episode_starts"][:]
     dones = f["done"][:]
     next_start = np.concatenate([starts[1:], [n]])
     is_last = np.zeros(n, dtype=bool)
     is_last[next_start - 1] = True
 
-    candidates = np.arange(max(n - seq_len + 1, 0))
+    candidates = np.arange(max(n - span + 1, 0))
     valid = np.ones(candidates.size, dtype=bool)
-    for k in range(seq_len):
+    for k in range(span):
         idx = candidates + k
-        # The window's LAST position is allowed to be a terminal frame (that's
-        # the whole point of training on episode-ending transitions) — only
-        # earlier positions must not be terminal/episode-final, otherwise the
-        # window would silently cross into the next episode.
-        if k < seq_len - 1:
+        # The window's LAST raw position is allowed to be a terminal frame
+        # (that's the whole point of training on episode-ending transitions)
+        # — only earlier positions must not be terminal/episode-final,
+        # otherwise the window would silently cross into the next episode.
+        if k < span - 1:
             valid &= dones[idx] == 0
             valid &= ~is_last[idx]
     return candidates[valid]
 
 
-def _gather_seq(ds: h5py.Dataset, picks: np.ndarray, seq_len: int) -> np.ndarray:
-    """Read a ``seq_len``-length window per start in ``picks`` → ``(B, L, ...)``.
+def _gather_seq(
+    ds: h5py.Dataset, picks: np.ndarray, seq_len: int, stride: int = 1, raw: bool = False
+) -> np.ndarray:
+    """Read a window per start in ``picks``.
 
-    Each window is read as a *contiguous* slice ``ds[s:s+seq_len]`` rather than
+    Each window is read as a *contiguous* slice ``ds[s:s+span]`` rather than
     via one scattered fancy-index gather. h5py point-selection on hundreds of
     non-contiguous indices is dominated by per-element selection overhead and
     is ~50× slower than contiguous slab reads here (measured 72 fps vs 3535 fps
     on the 224×224 pixel dataset), so this loop is the fast path even though it
-    issues ``B`` reads instead of one."""
+    issues ``B`` reads instead of one.
+
+    If ``raw`` is False (default): subsamples every ``stride``-th raw frame
+    from the block, returning ``(B, seq_len, ...)`` — this is what "one step"
+    observes when ``stride>1``: only the frame at the START of each block, not
+    the raw frames in between.
+
+    If ``raw`` is True: returns the FULL contiguous span ``(B, span, ...)``
+    with no subsampling — used for keys in ``_RAW_STRIDE_KEYS`` where every
+    raw value inside the block is needed by the caller (action concatenation,
+    reward summation).
+    """
+    span = (seq_len - 1) * stride + 1
     batch_size = picks.shape[0]
+    if raw:
+        out = np.empty((batch_size, span, *ds.shape[1:]), dtype=ds.dtype)
+        for i in range(batch_size):
+            s = int(picks[i])
+            out[i] = ds[s : s + span]
+        return out
     out = np.empty((batch_size, seq_len, *ds.shape[1:]), dtype=ds.dtype)
     for i in range(batch_size):
         s = int(picks[i])
-        out[i] = ds[s : s + seq_len]
+        block = ds[s : s + span]
+        out[i] = block[::stride] if stride > 1 else block
     return out
 
 
@@ -488,6 +532,7 @@ def _read_windows(
     picks: np.ndarray,
     seq_len: int,
     extra_keys: tuple[str, ...] = (),
+    stride: int = 1,
 ) -> dict[str, np.ndarray]:
     """Read windows starting at ``picks`` (local start indices) from one file.
 
@@ -497,21 +542,21 @@ def _read_windows(
     out: dict[str, np.ndarray] = {}
 
     for name in _TOP_LEVEL_SCHEMA:
-        out[name] = _gather_seq(f[name], picks, seq_len)
+        out[name] = _gather_seq(f[name], picks, seq_len, stride, raw=name in _RAW_STRIDE_KEYS)
 
     for group_path, schema in GROUPS.items():
         side_key = group_path.split("/")[-1]
         for name in schema:
             out[f"{side_key}/{name}"] = _gather_seq(
-                f[f"{group_path}/{name}"], picks, seq_len
+                f[f"{group_path}/{name}"], picks, seq_len, stride
             )
 
     if "pixels" in f:
-        out["pixels"] = _gather_seq(f["pixels"], picks, seq_len)
+        out["pixels"] = _gather_seq(f["pixels"], picks, seq_len, stride)
 
     for key in extra_keys:
         if key in f and key not in out:
-            out[key] = _gather_seq(f[key], picks, seq_len)
+            out[key] = _gather_seq(f[key], picks, seq_len, stride, raw=key in _RAW_STRIDE_KEYS)
 
     return out
 
@@ -522,6 +567,7 @@ def sample_window(
     batch_size: int,
     seq_len: int,
     rng: np.random.Generator,
+    stride: int = 1,
 ) -> dict[str, np.ndarray]:
     """Pick ``batch_size`` window starts and read all primitives + pixels.
 
@@ -529,7 +575,7 @@ def sample_window(
     they don't need a ``ReplayBuffer`` instance / writer thread).
     """
     pick = rng.choice(valid_starts, size=batch_size, replace=valid_starts.size < batch_size)
-    return _read_windows(f, pick, seq_len)
+    return _read_windows(f, pick, seq_len, stride=stride)
 
 
 def open_for_read(path: str) -> h5py.File:
@@ -633,12 +679,17 @@ class DataReader:
         """True when **all** loaded files contain the given top-level dataset."""
         return all(key in f for f in self._files)
 
-    def valid_seq_starts(self, seq_len: int) -> _MultiStarts:
-        """Compute valid sequence starts across all loaded files."""
+    def valid_seq_starts(self, seq_len: int, stride: int = 1) -> _MultiStarts:
+        """Compute valid sequence starts across all loaded files.
+
+        ``stride`` is the temporal frameskip: each of the ``seq_len`` steps in
+        the returned windows is ``stride`` raw frames apart (``stride=1`` is
+        the original unstrided behavior). See ``valid_seq_starts()`` above.
+        """
         all_fi: list[np.ndarray] = []
         all_local: list[np.ndarray] = []
         for i, f in enumerate(self._files):
-            local = valid_seq_starts(f, seq_len)
+            local = valid_seq_starts(f, seq_len, stride)
             if local.size > 0:
                 all_fi.append(np.full(local.size, i, dtype=np.int32))
                 all_local.append(local)
@@ -653,6 +704,7 @@ class DataReader:
         seq_len: int,
         rng: np.random.Generator,
         extra_keys: tuple[str, ...] = (),
+        stride: int = 1,
     ) -> dict[str, np.ndarray]:
         """Sample ``batch_size`` sequence windows. Returns the same dict
         format as the single-file ``sample_window``."""
@@ -663,7 +715,7 @@ class DataReader:
 
         # Fast path: single file
         if self.num_files == 1:
-            return _read_windows(self._files[0], picked_locals, seq_len, extra_keys)
+            return _read_windows(self._files[0], picked_locals, seq_len, extra_keys, stride)
 
         unique_files = np.unique(picked_files)
 
@@ -676,7 +728,7 @@ class DataReader:
             mask = picked_files == fi_int
             local_starts_for_file = picked_locals[mask]
             file_batches[fi_int] = _read_windows(
-                self._files[fi_int], local_starts_for_file, seq_len, extra_keys
+                self._files[fi_int], local_starts_for_file, seq_len, extra_keys, stride
             )
             local_pos[np.where(mask)[0]] = np.arange(mask.sum())
 

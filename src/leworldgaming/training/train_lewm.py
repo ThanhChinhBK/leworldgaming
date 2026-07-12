@@ -62,6 +62,13 @@ DEFAULTS: dict[str, Any] = {
     "action_dim": 56,
     "projector_hidden": 2048,
     "history_size": 3,
+    # Temporal frameskip: number of raw environment frames per training
+    # "step". stride=1 (default) is unstrided/backward-compatible. stride=5
+    # matches the original LeWM paper's frameskip convention — each step's
+    # observation is the frame at the block's start, and its action is the
+    # concatenation of all `stride` raw one-hot actions within the block
+    # (effective ActionEncoder input dim becomes action_dim * temporal_stride).
+    "temporal_stride": 1,
     # Encoder (ViT)
     "encoder_image_size": 224,
     "encoder_patch_size": 16,
@@ -121,9 +128,10 @@ def train(
     device = best_device()
     history_size = int(cfg["history_size"])
     seq_len = history_size + 1
+    stride = int(cfg.get("temporal_stride", 1) or 1)
     print(
         f"[train_lewm] device={device} steps={num_steps} batch_size={cfg['batch_size']} "
-        f"history={history_size}"
+        f"history={history_size} temporal_stride={stride}"
     )
     print(f"[train_lewm] data={cfg['data_path']} ckpt={cfg['ckpt_path']}")
 
@@ -147,8 +155,12 @@ def train(
         latent_dim=int(cfg["latent_dim"]),
         hidden_dim=int(cfg["projector_hidden"]),
     ).to(device)
+    # ActionEncoder's input width scales with the frameskip: it needs to see
+    # every raw one-hot action inside a stride block, concatenated, not just
+    # one snapshot action (matches the original LeWM paper's
+    # ``effective_act_dim = frameskip * action_dim``).
     action_encoder = ActionEncoder(
-        action_dim=int(cfg["action_dim"]),
+        action_dim=int(cfg["action_dim"]) * stride,
         emb_dim=int(cfg["latent_dim"]),
     ).to(device)
     predictor = Predictor(
@@ -273,7 +285,7 @@ def train(
         return pred_loss, reg_loss, z_norm
 
     with DataReader(cfg["data_path"]) as reader:
-        valid_starts = reader.valid_seq_starts(seq_len)
+        valid_starts = reader.valid_seq_starts(seq_len, stride=stride)
         if valid_starts.size == 0:
             raise RuntimeError("No valid sequences in replay buffer.")
 
@@ -305,10 +317,10 @@ def train(
             val_rng = np.random.default_rng(12345)
             for _ in range(n_batches):
                 batch = reader.sample_window(
-                    val_starts, batch_size, seq_len, val_rng
+                    val_starts, batch_size, seq_len, val_rng, stride=stride
                 )
                 pixels, a_oh = _to_device_seq(
-                    batch["pixels"], batch["action"], action_dim, device
+                    batch["pixels"], batch["action"], action_dim, device, stride=stride
                 )
                 pl, rl, zn = _step_forward(pixels, a_oh)
                 losses.append(pl.item())
@@ -324,10 +336,10 @@ def train(
         modules.train()
         for step in range(start_step, num_steps):
             batch = reader.sample_window(
-                train_starts, batch_size, seq_len, rng
+                train_starts, batch_size, seq_len, rng, stride=stride
             )
             pixels, a_oh = _to_device_seq(
-                batch["pixels"], batch["action"], action_dim, device
+                batch["pixels"], batch["action"], action_dim, device, stride=stride
             )
 
             with amp_autocast(device):

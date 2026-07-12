@@ -103,11 +103,43 @@ def to_device_seq(
     actions_np: np.ndarray,
     action_dim: int,
     device: torch.device,
+    stride: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Move pixels (``[-1, 1]`` normalised float32) and one-hot actions to ``device``."""
+    """Move pixels (``[-1, 1]`` normalised float32) and one-hot actions to ``device``.
+
+    ``stride`` (temporal frameskip): when >1, ``actions_np`` is expected to be
+    the FULL raw (un-subsampled) span of shape ``(B, (steps)*stride[+1])`` —
+    see ``replay_buffer._RAW_STRIDE_KEYS``. Every raw one-hot action inside
+    each ``stride``-sized block is concatenated into one
+    ``stride * action_dim``-wide vector per step, matching the original LeWM
+    paper's ``effective_act_dim = frameskip * action_dim`` convention (the AR
+    predictor needs to know everything that happened during the skipped
+    frames, not just a single snapshot action).
+    """
     pixels = (
         torch.from_numpy(pixels_np).to(device, dtype=torch.float32).div_(127.5).sub_(1.0)
     )
     actions = torch.from_numpy(actions_np.astype(np.int64)).to(device)
-    a_oh = nn.functional.one_hot(actions, num_classes=action_dim).float()
+    a_oh_raw = nn.functional.one_hot(actions, num_classes=action_dim).float()
+    if stride == 1:
+        return pixels, a_oh_raw
+    b, span = actions.shape
+    steps = span // stride
+    a_oh = a_oh_raw[:, : steps * stride].reshape(b, steps, stride * action_dim)
     return pixels, a_oh
+
+
+def reduce_reward_seq(rewards_raw: torch.Tensor, stride: int) -> torch.Tensor:
+    """Sum raw per-frame rewards into one value per ``stride``-sized block.
+
+    ``rewards_raw``: ``(B, span)`` full raw span (see ``_RAW_STRIDE_KEYS``).
+    Returns ``(B, steps)`` where ``steps = span // stride`` — the reward
+    earned while executing one step's action-block, matching the frameskip
+    convention where a "step" covers ``stride`` raw environment frames.
+    ``stride=1`` returns the input unchanged (steps == span).
+    """
+    if stride == 1:
+        return rewards_raw
+    b, span = rewards_raw.shape
+    steps = span // stride
+    return rewards_raw[:, : steps * stride].reshape(b, steps, stride).sum(dim=-1)
