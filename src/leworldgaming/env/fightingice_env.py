@@ -81,15 +81,13 @@ class EnvConfig:
 
 
 def _to_pixel_tensor(px: np.ndarray | None, image_size: int):
-    """uint8 (3,H,W) framebuffer -> float32 tensor in [-1, 1] (training norm).
-
-    Matches ``training/_replay_utils.to_device_seq``: ``x/127.5 - 1``. Left on
-    CPU; ``LewmAgent.act`` moves it to the model device.
-    """
+    """uint8 framebuffer -> the same ImageNet normalization used for training."""
     import torch
 
+    from leworldgaming.utils.image import normalize_imagenet_pixels
+
     arr = np.zeros((3, image_size, image_size), dtype=np.uint8) if px is None else px
-    return torch.from_numpy(np.ascontiguousarray(arr)).to(dtype=torch.float32).div_(127.5).sub_(1.0)
+    return normalize_imagenet_pixels(torch.from_numpy(np.ascontiguousarray(arr)))
 
 
 class _BridgeAI(AIInterface):
@@ -245,6 +243,7 @@ class _BridgeAI(AIInterface):
         self._decisions = 0
         self._skip_ctr = 0
         self._pending_action = None
+        self._cc.skill_cancel()
 
     def game_end(self) -> None:
         self._obs_q.put(("game_end", None, 0.0, True, {"game_end": True}))

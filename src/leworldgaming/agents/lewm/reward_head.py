@@ -13,7 +13,7 @@ from torch import nn
 
 
 class RewardHead(nn.Module):
-    def __init__(self, latent_dim: int = 256, hidden_dim: int = 512, num_bins: int = 41) -> None:
+    def __init__(self, latent_dim: int = 192, hidden_dim: int = 512, num_bins: int = 41) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(latent_dim * 2, hidden_dim),

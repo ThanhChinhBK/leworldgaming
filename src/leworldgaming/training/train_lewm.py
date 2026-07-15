@@ -8,7 +8,7 @@ replay, runs::
     ctx_emb   = emb[:, :T]                             # history
     tgt_emb   = emb[:, 1:]                             # one-step ahead targets
     pred_emb  = pred_proj(predictor(ctx_emb, act_emb)) # (B, T,   D)
-    L = ||pred_emb - sg(tgt_emb)||^2 + lambda * SIGReg(emb)
+    L = ||pred_emb - tgt_emb||^2 + lambda * SIGReg(emb)
 
 The AR predictor's causal self-attention turns one forward pass into ``T``
 parallel next-step predictions per batch element — same compute, ``T``× the
@@ -24,7 +24,7 @@ Architecture notes:
   conditioning. ``ActionEncoder`` projects one-hot actions into the same
   ``latent_dim`` the predictor expects.
 * SIGReg pulls the post-projector distribution toward N(0, I).
-* Targets are detached, so loss flows through the prediction branch only.
+* As in the reference source, prediction loss flows through both branches.
 
 Validation: a tail slice of valid sequence-start indices is held out;
 ``pred_loss`` / SIGReg are evaluated on it periodically with BN in train
@@ -58,7 +58,7 @@ from leworldgaming.utils.seed import set_seed
 
 DEFAULTS: dict[str, Any] = {
     # Architecture
-    "latent_dim": 256,
+    "latent_dim": 192,
     "action_dim": 56,
     "projector_hidden": 2048,
     "history_size": 3,
@@ -71,7 +71,7 @@ DEFAULTS: dict[str, Any] = {
     "temporal_stride": 1,
     # Encoder (ViT)
     "encoder_image_size": 224,
-    "encoder_patch_size": 16,
+    "encoder_patch_size": 14,
     "encoder_embed_dim": 192,
     "encoder_depth": 12,
     "encoder_heads": 3,
@@ -84,12 +84,12 @@ DEFAULTS: dict[str, Any] = {
     "predictor_mlp_dim": 2048,
     "predictor_dropout": 0.1,
     # Optimization
-    "batch_size": 16,
-    "lr": 3.0e-4,
+    "batch_size": 128,
+    "lr": 5.0e-5,
     "weight_decay": 1.0e-3,
     "grad_clip": 1.0,
     # Loss
-    "sigreg_lambda": 0.1,
+    "sigreg_lambda": 0.09,
     "sigreg_knots": 17,
     "sigreg_num_proj": 1024,
     # Data + I/O
@@ -100,7 +100,7 @@ DEFAULTS: dict[str, Any] = {
     "val_every": 25,
     "val_batches": 8,
     "ckpt_every": 1000,
-    "seed": 0,
+    "seed": 3072,
     # Resume: if True and ckpt_path exists, load weights + optimizer state and
     # continue from the saved step. num_steps is treated as the TOTAL target.
     "resume": False,
@@ -211,16 +211,17 @@ def train(
     ckpt_path = Path(cfg["ckpt_path"])
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     start_step = 0
+    resume_ckpt: dict[str, Any] | None = None
     if bool(cfg.get("resume", False)) and ckpt_path.exists():
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        encoder.load_state_dict(ckpt["encoder"])
-        projector.load_state_dict(ckpt["projector"])
-        action_encoder.load_state_dict(ckpt["action_encoder"])
-        predictor.load_state_dict(ckpt["predictor"])
-        pred_proj.load_state_dict(ckpt["pred_proj"])
-        if "optim" in ckpt:
-            optim.load_state_dict(ckpt["optim"])
-        start_step = int(ckpt.get("num_steps", 0))
+        resume_ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        encoder.load_state_dict(resume_ckpt["encoder"])
+        projector.load_state_dict(resume_ckpt["projector"])
+        action_encoder.load_state_dict(resume_ckpt["action_encoder"])
+        predictor.load_state_dict(resume_ckpt["predictor"])
+        pred_proj.load_state_dict(resume_ckpt["pred_proj"])
+        if "optim" in resume_ckpt:
+            optim.load_state_dict(resume_ckpt["optim"])
+        start_step = int(resume_ckpt.get("num_steps", 0))
         print(
             f"[train_lewm] resumed from {ckpt_path} at step={start_step} "
             f"-> training to {num_steps}"
@@ -231,9 +232,20 @@ def train(
                 f"num_steps ({num_steps}). Raise --steps to continue."
             )
     elif bool(cfg.get("resume", False)):
-        print(f"[train_lewm] --resume set but no checkpoint at {ckpt_path} — starting fresh")
+        raise FileNotFoundError(
+            f"--resume was requested but checkpoint does not exist: {ckpt_path}"
+        )
 
     rng = np.random.default_rng(int(cfg["seed"]))
+    if resume_ckpt is not None:
+        if "numpy_rng_state" in resume_ckpt:
+            rng.bit_generator.state = resume_ckpt["numpy_rng_state"]
+        if "torch_rng_state" in resume_ckpt:
+            torch.set_rng_state(resume_ckpt["torch_rng_state"].cpu())
+        if torch.cuda.is_available() and "cuda_rng_state_all" in resume_ckpt:
+            torch.cuda.set_rng_state_all(
+                [state.cpu() for state in resume_ckpt["cuda_rng_state_all"]]
+            )
 
     sigreg_lambda = float(cfg["sigreg_lambda"])
     grad_clip = float(cfg["grad_clip"])
@@ -256,6 +268,13 @@ def train(
                 "optim": optim.state_dict(),
                 "config": cfg,
                 "num_steps": step_done,
+                "format_version": 2,
+                "pixel_normalization": "imagenet",
+                "numpy_rng_state": rng.bit_generator.state,
+                "torch_rng_state": torch.get_rng_state(),
+                "cuda_rng_state_all": (
+                    torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+                ),
             },
             tmp,
         )
@@ -278,7 +297,7 @@ def train(
         pred = pred_proj(predictor(ctx_emb, ctx_act).reshape(b * history_size, -1)).reshape(
             b, history_size, -1
         )
-        pred_loss = nn.functional.mse_loss(pred, tgt_emb.detach())
+        pred_loss = nn.functional.mse_loss(pred, tgt_emb)
         # SIGReg expects (T, B, D) per the reference, averages over T.
         reg_loss = sigreg(emb.transpose(0, 1).reshape(t, b, -1))
         z_norm = ctx_emb.float().norm(dim=-1).mean()
@@ -294,19 +313,19 @@ def train(
                 "LeWM requires pixel data — re-collect with --pixels or check your data directory."
             )
 
-        n = valid_starts.size
-        n_val = max(int(n * float(cfg["val_split"])), batch_size)
-        n_val = min(n_val, n - batch_size)
-        train_starts = valid_starts[: n - n_val]
-        val_starts = valid_starts[n - n_val :]
+        train_starts, val_starts = valid_starts.split_by_episode(
+            float(cfg["val_split"]), int(cfg["seed"])
+        )
         print(
             f"[train_lewm] files={reader.num_files} frames={reader.total_frames} "
-            f"valid_seq_starts={n} train={train_starts.size} val={val_starts.size} "
+            f"valid_seq_starts={valid_starts.size} "
+            f"train={train_starts.size} val={val_starts.size} "
             f"episodes={reader.total_episodes}"
         )
 
         @torch.no_grad()
         def evaluate() -> dict[str, float]:
+            modules.eval()
             losses: list[float] = []
             sigregs: list[float] = []
             znorms: list[float] = []
@@ -326,11 +345,13 @@ def train(
                 losses.append(pl.item())
                 sigregs.append(rl.item())
                 znorms.append(zn.item())
-            return {
+            result = {
                 "val_pred_loss": float(np.mean(losses)),
                 "val_sigreg": float(np.mean(sigregs)),
                 "val_z_norm": float(np.mean(znorms)),
             }
+            modules.train()
+            return result
 
         t0 = time.time()
         modules.train()
@@ -380,9 +401,13 @@ def train(
                     f"|z|={val_metrics['val_z_norm']:.2f}"
                 )
 
-            if ckpt_every > 0 and step > 0 and step % ckpt_every == 0:
-                _save_ckpt(step, ckpt_path)
-                print(f"[train_lewm] step={step:5d}  saved checkpoint -> {ckpt_path}")
+            completed_steps = step + 1
+            if ckpt_every > 0 and completed_steps % ckpt_every == 0:
+                _save_ckpt(completed_steps, ckpt_path)
+                print(
+                    f"[train_lewm] step={completed_steps:5d}  "
+                    f"saved checkpoint -> {ckpt_path}"
+                )
 
         elapsed = time.time() - t0
         steps_run = max(num_steps - start_step, 0)

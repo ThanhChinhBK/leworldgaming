@@ -87,9 +87,9 @@ class Encoder(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
-        latent_dim: int = 256,
+        latent_dim: int = 192,
         image_size: int = 224,
-        patch_size: int = 16,
+        patch_size: int = 14,
         embed_dim: int = 192,
         depth: int = 6,
         num_heads: int = 3,

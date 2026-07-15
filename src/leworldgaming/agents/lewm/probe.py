@@ -11,7 +11,7 @@ from torch import nn
 
 
 class LinearProbe(nn.Module):
-    def __init__(self, latent_dim: int = 256, target_dim: int = 4) -> None:
+    def __init__(self, latent_dim: int = 192, target_dim: int = 4) -> None:
         super().__init__()
         self.head = nn.Linear(latent_dim, target_dim)
 

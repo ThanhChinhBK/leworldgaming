@@ -13,9 +13,7 @@ depends on inter-sample relationships, so the projector cannot drive all
 samples in a batch to the same value without paying a cost. LayerNorm
 lacks this property and lets the encoder collapse on small batches.
 
-We bump BN momentum to 0.5 (PyTorch default 0.1) so the running stats
-converge fast — important for short runs where the model gets used for
-single-frame inference (B=1) before BN running stats have many updates.
+The default BatchNorm settings match ``external/le-wm/module.py::MLP``.
 """
 
 from __future__ import annotations
@@ -35,10 +33,10 @@ class Projector(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 256,
+        latent_dim: int = 192,
         hidden_dim: int = 2048,
         norm: str = "batch",
-        bn_momentum: float = 0.5,
+        bn_momentum: float = 0.1,
     ) -> None:
         super().__init__()
         if norm == "batch":

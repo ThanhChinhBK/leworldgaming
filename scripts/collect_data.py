@@ -59,7 +59,10 @@ def parse_args() -> argparse.Namespace:
                         default="/media/jeovach/New Volume/leworldgaming/replay.h5")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-record-p2", action="store_true",
-                        help="Only record P1 (halves storage when P1=P2 self-play)")
+                        help="No-op when both P1 and P2 are non-JVM: P2 recording is "
+                             "always disabled in that case (recording both perspectives "
+                             "into one shared buffer corrupts own/opp — see comment in "
+                             "run()). Only meaningful when P1 is a JVM AI and P2 is not.")
     parser.add_argument("--timeout", type=int, default=300,
                         help="Hard wallclock timeout in seconds (default 300, scaled by --games)")
     parser.add_argument("--pixels", action="store_true",
@@ -67,7 +70,48 @@ def parse_args() -> argparse.Namespace:
                              "the JVM to be in render mode (native macOS, or docker MODE=pixels).")
     parser.add_argument("--image-size", type=int, default=224,
                         help="Pixel side length in the buffer (default 224, ViT-friendly)")
+    parser.add_argument("--stall-timeout", type=int, default=90,
+                        help="Seconds of no buffer/frame growth before treating the run "
+                             "as stalled and exiting early (default 90). This catches JVM "
+                             "engine deadlocks (e.g. round-transition hangs with built-in "
+                             "MCTS AIs) that would otherwise silently hang until --timeout. "
+                             "Set to 0 to disable.")
     return parser.parse_args()
+
+
+async def _stall_watchdog(
+    buffer: ReplayBuffer,
+    spectator: SpectatorRecorder | None,
+    stall_timeout: int,
+    ai_tasks: list[asyncio.Task],
+) -> None:
+    """Cancel `ai_tasks` if neither the buffer nor the spectator has made any
+    progress for `stall_timeout` seconds — signals a JVM-side deadlock
+    (engine round-transition hang, or an AI task silently dying while its
+    JVM socket stays open) instead of hanging until the full --timeout."""
+    last_len = len(buffer)
+    last_frames = spectator.frames_seen if spectator is not None else 0
+    last_progress = time.monotonic()
+    check_every = max(5, stall_timeout // 6)
+    while True:
+        await asyncio.sleep(check_every)
+        cur_len = len(buffer)
+        cur_frames = spectator.frames_seen if spectator is not None else 0
+        if cur_len != last_len or cur_frames != last_frames:
+            last_len, last_frames = cur_len, cur_frames
+            last_progress = time.monotonic()
+            continue
+        stalled_for = time.monotonic() - last_progress
+        if stalled_for >= stall_timeout:
+            logging.error(
+                "no progress (buffer/pixel frames unchanged) for %.0fs — "
+                "treating as a JVM-side stall/deadlock and cancelling AI tasks",
+                stalled_for,
+            )
+            for t in ai_tasks:
+                if not t.done():
+                    t.cancel()
+            return
 
 
 async def run(args: argparse.Namespace) -> None:
@@ -121,11 +165,35 @@ async def run(args: argparse.Namespace) -> None:
     if p2_is_jvm:
         agent_names.append(args.policy_p2)  # pass JVM name directly
     else:
+        # Both P1 and P2 being non-JVM means BOTH get a RecordingAI writing
+        # to this same `buffer`. Recording both perspectives into one shared
+        # buffer is unconditionally unsafe: each side's own/opp columns
+        # describe the same underlying match from opposite viewpoints, and
+        # their `buffer.add()` calls interleave on a single FIFO write queue
+        # with no player-identity tag or ordering guarantee. The result is
+        # an own/opp column pair that appears to "swap" almost every frame
+        # (own+opp totals stay constant across the flip) — this corrupted
+        # two of our earlier self-play recordings (random_v_random,
+        # aggressive_v_aggressive) and silently destroyed most of the
+        # reward signal once rewards were block-summed under temporal_stride.
+        # P2 recording is therefore always disabled whenever P1 is also
+        # non-JVM, regardless of --no-record-p2. To capture both
+        # perspectives, run two separate collection passes into two
+        # separate output files instead.
+        if not p1_is_jvm and not args.no_record_p2:
+            logging.warning(
+                "P1 and P2 are both non-JVM policies sharing one buffer — "
+                "forcing P2 recording off to avoid own/opp perspective "
+                "interleaving corruption. Run a second pass with --policy-p1 "
+                "%s --policy-p2 %s if you need P2's perspective recorded "
+                "separately.",
+                args.policy_p2, args.policy_p1,
+            )
         p2 = RecordingAI(
             name="LWG_P2",
             policy=make_policy(args.policy_p2, seed=args.seed + 1),
             buffer=buffer,
-            record=not args.no_record_p2,
+            record=(not args.no_record_p2) and p1_is_jvm,
             pixel_source=spectator,
             total_games=args.games,
         )
@@ -163,6 +231,12 @@ async def run(args: argparse.Namespace) -> None:
         ctrl = StreamController(args.host, args.port, spectator, keep_alive=False)
         spectator_task = asyncio.create_task(ctrl.run())
 
+    watchdog_task: asyncio.Task | None = None
+    if args.stall_timeout > 0:
+        watchdog_task = asyncio.create_task(
+            _stall_watchdog(buffer, spectator, args.stall_timeout, ai_tasks)
+        )
+
     # SIGINT/SIGTERM cancel AI tasks so the `finally` flush runs.
     loop = asyncio.get_running_loop()
 
@@ -195,6 +269,10 @@ async def run(args: argparse.Namespace) -> None:
     except asyncio.CancelledError:
         logging.info("game cancelled")
     finally:
+        if watchdog_task is not None and not watchdog_task.done():
+            watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await watchdog_task
         # Close control connection (may already be closed by JVM).
         with contextlib.suppress(Exception):
             writer.close()

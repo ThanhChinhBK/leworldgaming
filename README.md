@@ -199,9 +199,9 @@ Config is loaded from `configs/lewm.yaml` by default. Key knobs:
 | `encoder_depth` | 12 | ViT depth (6 for fast iteration, 12 for ViT-tiny parity) |
 | `history_size` | 3 | AR context window — predictor sees this many past frames |
 | `predictor_depth` | 6 | Transformer layers in the AR predictor |
-| `batch_size` | 16 | Sequences per step (each = `history_size+1` frames through ViT) |
-| `lr` | 3e-4 | AdamW learning rate |
-| `sigreg_lambda` | 0.1 | Weight of SIGReg anti-collapse regularizer |
+| `batch_size` | 128 | Sequences per step (matches the LeWM source config) |
+| `lr` | 5e-5 | AdamW learning rate (matches the LeWM source config) |
+| `sigreg_lambda` | 0.09 | Weight of SIGReg anti-collapse regularizer |
 
 Override any key via CLI or kwarg:
 
@@ -218,7 +218,7 @@ step=  29  val  pred=0.2140 sigreg=0.8117 |z|=10.21
 
 - **pred** — MSE prediction loss (lower = better next-frame prediction)
 - **sigreg** — regularizer loss (pushes embeddings toward N(0,I))
-- **|z|** — mean embedding L2 norm; healthy range ≈ √latent_dim ≈ **15–16** for dim=256. Collapse → 0, explosion → >>16.
+- **|z|** — mean embedding L2 norm; healthy range ≈ √latent_dim ≈ **13–14** for dim=192. Collapse → 0, explosion → >>14.
 - **grad** — gradient norm after clipping (should stay ≤ `grad_clip`)
 
 ### 4. Checkpoint & inference
@@ -233,21 +233,22 @@ agent.load("data/lewm_checkpoint.pt")  # rebuilds architecture from stored confi
 action = agent.act({"pixels": frame_tensor})  # (3, 224, 224) float
 ```
 
-### Architecture (22.98M params at default config)
+### Architecture
 
 ```
-ViT-12 encoder (5.57M) → Projector (1.05M) → AR Predictor (14.97M) → pred_proj (1.05M)
-                                                ↑ conditioned on ActionEncoder (0.32M)
+ViT-tiny encoder → Projector → AR Predictor → pred_proj
+                                      ↑ conditioned on ActionEncoder
 ```
 
 The AR predictor uses causal self-attention + AdaLN-zero conditioning on per-step action embeddings, so one forward pass yields `T` parallel next-step predictions during training.
 
-### 5. Stage B: head training for MCTS planning
+### 5. Stage B: head training for latent random-shooting planning
 
 After Stage A converges, fit the reward / continuation / value / probe
-heads on the same replay so LeWM exposes the same `(z, a) → z', r̂, ĉ, V̂`
-interface as Dreamer / PETS. JEPA components are frozen; only the heads
-update.
+heads on the same replay so LeWM exposes `(z, a) → z', r̂, ĉ, V̂`.
+JEPA components are frozen; only the heads update. The live planner scores
+sampled latent trajectories with trained reward/continuation/value heads;
+this repository does not currently implement tree-search MCTS.
 
 ```bash
 uv run python scripts/train.py --agent lewm --stage b --steps 20000
@@ -258,7 +259,7 @@ Heads added (each a small MLP on top of the latent `z`):
 | Head | Input | Loss | Notes |
 |---|---|---|---|
 | `RewardHead` | `(z, a_emb)` | twohot CE on HP-delta | TD-MPC2 / DreamerV3 discrete-regression bins |
-| `ContinuationHead` | `z` | BCE on `1 - done` | MCTS termination signal |
+| `ContinuationHead` | `z` | balanced BCE on `1 - done` | rollout termination signal |
 | `ValueHead` | `z` | twohot CE on λ-return | bootstrap via EMA target net |
 | `LinearProbe` | `z` | MSE on physical targets | finally trained — used by `planner.py` |
 
@@ -296,7 +297,7 @@ step= 100 train r=0.05 c=0.001 v=0.6 r_im=0.06 c_im=0.001 probe=0.4 |z|=27 grad=
 
 The Stage-B checkpoint is self-contained: it carries the Stage-A weights
 plus the four heads, so `LewmAgent.load("data/lewm_heads_checkpoint.pt")`
-gives you a fully-headed agent ready for MCTS.
+gives the latent random-shooting planner access to the trained heads.
 
 ## Train DreamerV3 (offline)
 

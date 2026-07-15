@@ -7,7 +7,7 @@ from torch import nn
 
 
 class ContinuationHead(nn.Module):
-    def __init__(self, latent_dim: int = 256, hidden_dim: int = 512) -> None:
+    def __init__(self, latent_dim: int = 192, hidden_dim: int = 512) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),

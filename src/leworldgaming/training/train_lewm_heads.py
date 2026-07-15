@@ -77,6 +77,7 @@ DEFAULTS: dict[str, Any] = {
         "value_loss_weight": 0.0,
         "imagined_loss_weight": 0.0,
         "probe_loss_weight": 0.0,
+        "terminal_window_fraction": 0.1,
         # Indices into the legacy 52-dim state_vector to use as probe targets.
         # Default matches planner.py:64 convention: probe[..., 0] = HP-diff.
         # 47 = hp_diff (signed), 0 = hp_self, 22 = hp_opp, 46 = distance.
@@ -181,6 +182,29 @@ def _build_jepa_from_ckpt(ckpt: dict[str, Any], device: torch.device) -> dict[st
     }
 
 
+def _lambda_return(
+    rewards: torch.Tensor,
+    next_cont: torch.Tensor,
+    next_values: torch.Tensor,
+    gamma: float,
+    lam: float,
+) -> torch.Tensor:
+    """Compute λ-returns for aligned ``(s, a, r, s_next)`` transitions."""
+    if not (rewards.shape == next_cont.shape == next_values.shape):
+        raise ValueError(
+            "rewards, next_cont, and next_values must have equal shapes"
+        )
+    _, horizon = rewards.shape
+    returns = torch.zeros_like(rewards)
+    carry = next_values[:, -1]
+    for t in range(horizon - 1, -1, -1):
+        carry = rewards[:, t] + gamma * next_cont[:, t] * (
+            (1.0 - lam) * next_values[:, t] + lam * carry
+        )
+        returns[:, t] = carry
+    return returns
+
+
 def train(
     num_steps: int = 1000,
     config_path: str | Path | None = "configs/lewm_heads.yaml",
@@ -200,12 +224,50 @@ def train(
             f"{cfg['data_path']} not found — run scripts/collect_data.py --pixels first, "
             "or point --data-path at a directory of .h5 files"
         )
-    if not Path(cfg["ckpt_in"]).exists():
-        raise FileNotFoundError(
-            f"{cfg['ckpt_in']} not found — train Stage A first via scripts/train.py --agent lewm"
+    ckpt_out = Path(cfg["ckpt_out"])
+    ckpt_out.parent.mkdir(parents=True, exist_ok=True)
+    resume_ckpt: dict[str, Any] | None = None
+    if bool(cfg.get("resume", False)):
+        if not ckpt_out.exists():
+            raise FileNotFoundError(
+                f"--resume was requested but checkpoint does not exist: {ckpt_out}"
+            )
+        resume_ckpt = torch.load(ckpt_out, map_location=device, weights_only=False)
+        saved_heads_config = resume_ckpt.get("heads_config")
+        structural_head_keys = (
+            "reward_bins",
+            "reward_low",
+            "reward_high",
+            "value_bins",
+            "value_low",
+            "value_high",
+            "hidden_dim",
+            "probe_targets",
         )
+        if saved_heads_config is not None:
+            changed_structure = [
+                key
+                for key in structural_head_keys
+                if saved_heads_config.get(key) != hcfg.get(key)
+            ]
+            if changed_structure:
+                raise ValueError(
+                    "Stage-B resume cannot change head architecture keys: "
+                    + ", ".join(changed_structure)
+                )
 
-    ckpt_in = torch.load(cfg["ckpt_in"], map_location=device, weights_only=False)
+    if resume_ckpt is not None:
+        # Stage-B checkpoints are self-contained; resume the exact frozen JEPA
+        # paired with these heads even if ckpt_in was moved or replaced.
+        ckpt_in = resume_ckpt
+    else:
+        if not Path(cfg["ckpt_in"]).exists():
+            raise FileNotFoundError(
+                f"{cfg['ckpt_in']} not found — train Stage A first via "
+                "scripts/train.py --agent lewm"
+            )
+        ckpt_in = torch.load(cfg["ckpt_in"], map_location=device, weights_only=False)
+
     jepa = _build_jepa_from_ckpt(ckpt_in, device)
     encoder = jepa["encoder"]
     projector = jepa["projector"]
@@ -217,15 +279,11 @@ def train(
     action_dim: int = jepa["_action_dim"]
     stride: int = jepa["_temporal_stride"]
     imagined_horizon = int(hcfg["imagined_horizon"])
-    # Window covers `history_size` real frames + `imagined_horizon` rolled
-    # positions (+1 for the encoder-grounded last position when K=0).
-    seq_len = history_size + max(1, imagined_horizon)
-    # When stride>1 the action/reward at position T-1 needs raw frames one
-    # block beyond the observed span (see replay_buffer._RAW_STRIDE_KEYS), so
-    # we fetch one extra observed frame purely to derive that last action
-    # block, then trim pixels/dones/state_vec back down to `seq_len` before
-    # use. At stride=1 this is a no-op (window_len == seq_len).
-    window_len = seq_len + (1 if stride > 1 else 0)
+    # T transitions require T+1 grounded states. The endpoint is needed for
+    # the final reward block, terminal label, and value bootstrap at every
+    # stride (including stride=1).
+    transition_len = history_size + max(1, imagined_horizon)
+    state_len = transition_len + 1
 
     reward_head = RewardHead(
         latent_dim=latent_dim,
@@ -275,22 +333,19 @@ def train(
     # Optional resume: load heads + optimizer state and continue from the
     # saved step. num_steps is the TOTAL target, so re-running the same command
     # with a higher --steps extends training; an equal --steps is a no-op.
-    # NOTE: resuming reloads the heads (not the frozen JEPA, which always comes
-    # fresh from --ckpt-in) — it is meant to extend an interrupted Stage-B run
-    # for the SAME milestone config, not to switch milestones mid-run.
-    ckpt_out = Path(cfg["ckpt_out"])
-    ckpt_out.parent.mkdir(parents=True, exist_ok=True)
+    # Resuming restores the self-contained frozen JEPA, heads, optimizer, and
+    # RNG states. Loss weights and imagined horizon may change between M2-M5;
+    # architecture-changing head settings are rejected above.
     start_step = 0
-    if bool(cfg.get("resume", False)) and ckpt_out.exists():
-        prev_ckpt = torch.load(ckpt_out, map_location=device, weights_only=False)
-        reward_head.load_state_dict(prev_ckpt["reward_head"])
-        continuation_head.load_state_dict(prev_ckpt["continuation_head"])
-        value_head.load_state_dict(prev_ckpt["value_head"])
-        value_target_head.load_state_dict(prev_ckpt["value_target_head"])
-        probe.load_state_dict(prev_ckpt["probe"])
-        if "optim" in prev_ckpt:
-            optim.load_state_dict(prev_ckpt["optim"])
-        start_step = int(prev_ckpt.get("num_steps", 0))
+    if resume_ckpt is not None:
+        reward_head.load_state_dict(resume_ckpt["reward_head"])
+        continuation_head.load_state_dict(resume_ckpt["continuation_head"])
+        value_head.load_state_dict(resume_ckpt["value_head"])
+        value_target_head.load_state_dict(resume_ckpt["value_target_head"])
+        probe.load_state_dict(resume_ckpt["probe"])
+        if "optim" in resume_ckpt:
+            optim.load_state_dict(resume_ckpt["optim"])
+        start_step = int(resume_ckpt.get("num_steps", 0))
         print(
             f"[train_lewm_heads] resumed from {ckpt_out} at step={start_step} "
             f"-> training to {num_steps}"
@@ -300,10 +355,16 @@ def train(
                 f"[train_lewm_heads] nothing to do: start_step ({start_step}) >= "
                 f"num_steps ({num_steps}). Raise --steps to continue."
             )
-    elif bool(cfg.get("resume", False)):
-        print(f"[train_lewm_heads] --resume set but no checkpoint at {ckpt_out} — starting fresh")
-
     rng = np.random.default_rng(int(cfg["seed"]))
+    if resume_ckpt is not None:
+        if "numpy_rng_state" in resume_ckpt:
+            rng.bit_generator.state = resume_ckpt["numpy_rng_state"]
+        if "torch_rng_state" in resume_ckpt:
+            torch.set_rng_state(resume_ckpt["torch_rng_state"].cpu())
+        if torch.cuda.is_available() and "cuda_rng_state_all" in resume_ckpt:
+            torch.cuda.set_rng_state_all(
+                [state.cpu() for state in resume_ckpt["cuda_rng_state_all"]]
+            )
     grad_clip = float(cfg["grad_clip"])
     log_every = int(cfg["log_every"])
     val_every = int(cfg["val_every"])
@@ -317,6 +378,7 @@ def train(
     gamma = float(hcfg["gamma"])
     lam = float(hcfg["lambda_return"])
     target_ema = float(hcfg["target_ema"])
+    terminal_window_fraction = float(hcfg["terminal_window_fraction"])
     K = imagined_horizon
     probe_idx = torch.as_tensor(probe_targets, dtype=torch.long, device=device)
 
@@ -331,31 +393,18 @@ def train(
         emb = projector(encoder(flat))
         return emb.reshape(b, t, -1)
 
-    def _lambda_return(
-        rewards: torch.Tensor,
-        cont: torch.Tensor,
-        v_boot: torch.Tensor,
+    def _balanced_continuation_loss(
+        logits: torch.Tensor,
+        targets: torch.Tensor,
     ) -> torch.Tensor:
-        """Dreamer-style λ-return.
-
-        ``rewards``: (B, T) reward earned at step t (i.e. for transition t→t+1
-                     under our one-hot reward convention).
-        ``cont``:    (B, T) continuation prob at step t (1 - done).
-        ``v_boot``:  (B, T) bootstrap value at step t (from frozen target net).
-
-        Returns ``G`` of shape (B, T):
-            G_{T-1} = v_boot_{T-1}
-            G_t     = r_t + γ · cont_{t+1} · ((1-λ) · v_boot_{t+1} + λ · G_{t+1})
-        Computed without grads — used as twohot CE target.
-        """
-        B, T = rewards.shape
-        G = torch.zeros_like(rewards)
-        G[:, -1] = v_boot[:, -1]
-        for t in range(T - 2, -1, -1):
-            G[:, t] = rewards[:, t] + gamma * cont[:, t + 1] * (
-                (1.0 - lam) * v_boot[:, t + 1] + lam * G[:, t + 1]
-            )
-        return G
+        per_item = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none"
+        )
+        terminal = targets < 0.5
+        nonterminal = ~terminal
+        if terminal.any() and nonterminal.any():
+            return 0.5 * per_item[terminal].mean() + 0.5 * per_item[nonterminal].mean()
+        return per_item.mean()
 
     def _step_forward(
         pixels: torch.Tensor,
@@ -364,20 +413,20 @@ def train(
         dones: torch.Tensor,
         state_vec: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        z = _encode_grounded(pixels)                    # (B, T, D)
+        z_states = _encode_grounded(pixels)             # (B, T+1, D)
+        z = z_states[:, :transition_len]                # current states
+        z_next = z_states[:, 1:]                        # successor states
         a_emb = action_encoder(a_oh)                    # (B, T, D)
 
-        # Reward at index t: r_head(z[t], a_emb[t]) -> reward[t]
+        # Reward block t is earned after taking action block t from z[t].
         r_logits = reward_head(z, a_emb)                # (B, T, K)
         loss_r = twohot_ce_loss(r_logits, rewards, reward_bins)
 
-        # Continuation at index t (M2: predict cont[t] = 1 - done[t] from z[t]).
-        # In valid windows from valid_seq_start_indices, dones is all-zero by
-        # construction, so this is effectively a constant target — kept for
-        # pipeline correctness. M3+ will sample terminal-tail windows.
-        c_logits = continuation_head(z)                 # (B, T)
-        cont_target = (1.0 - dones.float())
-        loss_c = F.binary_cross_entropy_with_logits(c_logits, cont_target)
+        # Continuation is a state property. Include the endpoint so terminal
+        # states are supervised, and balance terminal/nonterminal examples.
+        c_logits = continuation_head(z_states)          # (B, T+1)
+        cont_target = 1.0 - dones.float()
+        loss_c = _balanced_continuation_loss(c_logits, cont_target)
 
         loss = w_r * loss_r + w_c * loss_c
         loss_v_val = torch.zeros((), device=device)
@@ -388,9 +437,12 @@ def train(
         if w_v > 0.0:
             v_logits = value_head(z)                     # (B, T, K_v)
             with torch.no_grad():
-                v_tgt_logits = value_target_head(z)
-                v_boot = twohot_decode(v_tgt_logits, value_bins)   # (B, T)
-                G = _lambda_return(rewards, cont_target, v_boot)   # (B, T)
+                v_tgt_logits = value_target_head(z_next)
+                next_values = twohot_decode(v_tgt_logits, value_bins)
+                next_cont = cont_target[:, 1:]
+                G = _lambda_return(
+                    rewards, next_cont, next_values, gamma=gamma, lam=lam
+                )
             loss_v = twohot_ce_loss(v_logits, G, value_bins)
             loss = loss + w_v * loss_v
             loss_v_val = loss_v.detach()
@@ -422,7 +474,7 @@ def train(
             )
             c_logits_im = continuation_head(z_im)                   # (B, K)
             cont_im_target = 1.0 - dones[:, history_size : history_size + K].float()
-            loss_c_im = F.binary_cross_entropy_with_logits(c_logits_im, cont_im_target)
+            loss_c_im = _balanced_continuation_loss(c_logits_im, cont_im_target)
             loss_imagined = loss_r_im + loss_c_im
             loss = loss + w_im * loss_imagined
             loss_im_val = loss_imagined.detach()
@@ -431,9 +483,9 @@ def train(
 
         loss_probe_val = torch.zeros((), device=device)
         if w_probe > 0.0 and state_vec is not None:
-            # state_vec: (B, T, 52). Pick the configured target columns.
-            phys = state_vec.index_select(dim=-1, index=probe_idx)   # (B, T, P)
-            probe_pred = probe(z)                                    # (B, T, P)
+            # Probe every grounded state, including the endpoint.
+            phys = state_vec.index_select(dim=-1, index=probe_idx)
+            probe_pred = probe(z_states)
             loss_probe = F.mse_loss(probe_pred, phys)
             loss = loss + w_probe * loss_probe
             loss_probe_val = loss_probe.detach()
@@ -447,27 +499,35 @@ def train(
             "loss_r_im": loss_r_im_val,
             "loss_c_im": loss_c_im_val,
             "loss_probe": loss_probe_val,
-            "z_norm": z.float().norm(dim=-1).mean().detach(),
+            "z_norm": z_states.float().norm(dim=-1).mean().detach(),
         }
 
     @torch.no_grad()
     def _ema_update_target() -> None:
-        for p, p_tgt in zip(value_head.parameters(), value_target_head.parameters()):
+        for p, p_tgt in zip(
+            value_head.parameters(), value_target_head.parameters(), strict=True
+        ):
             p_tgt.data.mul_(target_ema).add_(p.data, alpha=1.0 - target_ema)
 
     with DataReader(cfg["data_path"]) as reader:
-        valid_starts = reader.valid_seq_starts(window_len, stride=stride)
+        valid_starts = reader.valid_seq_starts(state_len, stride=stride)
         if valid_starts.size == 0:
             raise RuntimeError("No valid sequences in replay buffer.")
 
-        n = valid_starts.size
-        n_val = max(int(n * float(cfg["val_split"])), batch_size)
-        n_val = min(n_val, n - batch_size)
-        train_starts = valid_starts[: n - n_val]
-        val_starts = valid_starts[n - n_val :]
+        train_starts, val_starts = valid_starts.split_by_episode(
+            float(cfg["val_split"]), int(cfg["seed"])
+        )
+        train_terminal_starts = reader.terminal_ending_starts(
+            train_starts, state_len, stride
+        )
+        val_terminal_starts = reader.terminal_ending_starts(
+            val_starts, state_len, stride
+        )
         print(
             f"[train_lewm_heads] files={reader.num_files} frames={reader.total_frames} "
-            f"valid_seq_starts={n} train={train_starts.size} val={val_starts.size} "
+            f"valid_seq_starts={valid_starts.size} train={train_starts.size} "
+            f"val={val_starts.size} terminal_train={train_terminal_starts.size} "
+            f"terminal_val={val_terminal_starts.size} "
             f"episodes={reader.total_episodes} temporal_stride={stride}"
         )
 
@@ -477,11 +537,38 @@ def train(
             extra_keys = extra_keys + ("state_vector",)
 
         def _make_batch(
-            starts, batch_rng: np.random.Generator
+            starts,
+            terminal_starts,
+            batch_rng: np.random.Generator,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+            terminal_count = 0
+            if terminal_starts.size > 0 and terminal_window_fraction > 0.0:
+                terminal_count = min(
+                    batch_size - 1,
+                    max(1, int(round(batch_size * terminal_window_fraction))),
+                )
+            regular_count = batch_size - terminal_count
             batch = reader.sample_window(
-                starts, batch_size, window_len, batch_rng, extra_keys=extra_keys, stride=stride
+                starts,
+                regular_count,
+                state_len,
+                batch_rng,
+                extra_keys=extra_keys,
+                stride=stride,
             )
+            if terminal_count:
+                terminal_batch = reader.sample_window(
+                    terminal_starts,
+                    terminal_count,
+                    state_len,
+                    batch_rng,
+                    extra_keys=extra_keys,
+                    stride=stride,
+                )
+                batch = {
+                    key: np.concatenate([value, terminal_batch[key]], axis=0)
+                    for key, value in batch.items()
+                }
             pixels, a_oh = to_device_seq(
                 batch["pixels"], batch["action"], action_dim, device, stride=stride
             )
@@ -491,13 +578,6 @@ def train(
             state_vec: torch.Tensor | None = None
             if "state_vector" in batch:
                 state_vec = torch.from_numpy(batch["state_vector"]).to(device, dtype=torch.float32)
-            # pixels/dones/state_vec were fetched at `window_len` (one extra
-            # frame when stride>1, purely to derive the last action/reward
-            # block) — trim back down to `seq_len` so every tensor lines up.
-            pixels = pixels[:, :seq_len]
-            dones = dones[:, :seq_len]
-            if state_vec is not None:
-                state_vec = state_vec[:, :seq_len]
             return pixels, a_oh, rewards, dones, state_vec
 
         @torch.no_grad()
@@ -515,7 +595,9 @@ def train(
                 n_batches = min(n_batches, val_batches)
             val_rng = np.random.default_rng(12345)
             for _ in range(n_batches):
-                pixels, a_oh, rewards, dones, state_vec = _make_batch(val_starts, val_rng)
+                pixels, a_oh, rewards, dones, state_vec = _make_batch(
+                    val_starts, val_terminal_starts, val_rng
+                )
                 out = _step_forward(pixels, a_oh, rewards, dones, state_vec)
                 losses_r.append(out["loss_r"].item())
                 losses_c.append(out["loss_c"].item())
@@ -556,6 +638,15 @@ def train(
                     "heads_config": hcfg,
                     "stage": "B",
                     "num_steps": step_done,
+                    "format_version": 2,
+                    "pixel_normalization": "imagenet",
+                    "numpy_rng_state": rng.bit_generator.state,
+                    "torch_rng_state": torch.get_rng_state(),
+                    "cuda_rng_state_all": (
+                        torch.cuda.get_rng_state_all()
+                        if torch.cuda.is_available()
+                        else []
+                    ),
                 },
                 tmp,
             )
@@ -564,7 +655,9 @@ def train(
         t0 = time.time()
         head_modules.train()
         for step in range(start_step, num_steps):
-            pixels, a_oh, rewards, dones, state_vec = _make_batch(train_starts, rng)
+            pixels, a_oh, rewards, dones, state_vec = _make_batch(
+                train_starts, train_terminal_starts, rng
+            )
 
             with amp_autocast(device):
                 out = _step_forward(pixels, a_oh, rewards, dones, state_vec)
@@ -610,14 +703,20 @@ def train(
                     f"probe={vm['val_loss_probe']:.4f}"
                 )
 
-            if ckpt_every > 0 and step > 0 and step % ckpt_every == 0:
-                _save_ckpt(step, ckpt_out)
-                print(f"[train_lewm_heads] step={step:5d}  saved checkpoint -> {ckpt_out}")
+            completed_steps = step + 1
+            if ckpt_every > 0 and completed_steps % ckpt_every == 0:
+                _save_ckpt(completed_steps, ckpt_out)
+                print(
+                    f"[train_lewm_heads] step={completed_steps:5d}  "
+                    f"saved checkpoint -> {ckpt_out}"
+                )
 
         elapsed = time.time() - t0
-        print(f"[train_lewm_heads] done in {elapsed:.1f}s ({num_steps / elapsed:.1f} step/s)")
+        steps_run = max(num_steps - start_step, 0)
+        rate = steps_run / elapsed if elapsed > 0 else 0.0
+        print(f"[train_lewm_heads] done in {elapsed:.1f}s ({rate:.1f} step/s)")
 
-    _save_ckpt(num_steps, ckpt_out)
+    _save_ckpt(max(start_step, num_steps), ckpt_out)
     print(f"[train_lewm_heads] saved checkpoint -> {ckpt_out}")
 
     return {

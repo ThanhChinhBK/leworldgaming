@@ -171,6 +171,8 @@ class ReplayBuffer:
             self._n = self._f["action"].shape[0]
             self._n_episodes = self._f["episode_starts"].shape[0]
             self._episode_start = self._n
+        self._f.attrs["writer_active"] = np.uint8(1)
+        self._f.flush()
 
         self._writer_thread = threading.Thread(
             target=self._writer_loop, name="replay-writer", daemon=False,
@@ -276,6 +278,9 @@ class ReplayBuffer:
                 exc, self._writer_exc = self._writer_exc, None
                 raise exc
         if self._f is not None:
+            if not self.cfg.read_only:
+                self._f.attrs["writer_active"] = np.uint8(0)
+                self._f.flush()
             self._f.close()
             self._f = None
 
@@ -595,11 +600,23 @@ class _MultiStarts:
     for the flat ``np.ndarray`` the single-file path used to return.
     """
 
-    __slots__ = ("file_indices", "local_starts")
+    __slots__ = ("file_indices", "local_starts", "episode_indices")
 
-    def __init__(self, file_indices: np.ndarray, local_starts: np.ndarray) -> None:
-        self.file_indices = np.asarray(file_indices, dtype=np.int32)
-        self.local_starts = np.asarray(local_starts, dtype=np.int64)
+    def __init__(
+        self,
+        file_indices: np.ndarray,
+        local_starts: np.ndarray,
+        episode_indices: np.ndarray,
+    ) -> None:
+        self.file_indices = np.atleast_1d(np.asarray(file_indices, dtype=np.int32))
+        self.local_starts = np.atleast_1d(np.asarray(local_starts, dtype=np.int64))
+        self.episode_indices = np.atleast_1d(np.asarray(episode_indices, dtype=np.int32))
+        if not (
+            self.file_indices.shape
+            == self.local_starts.shape
+            == self.episode_indices.shape
+        ):
+            raise ValueError("file, local-start, and episode arrays must have equal shape")
 
     @property
     def size(self) -> int:
@@ -609,7 +626,51 @@ class _MultiStarts:
         return len(self.file_indices)
 
     def __getitem__(self, idx):  # noqa: ANN001
-        return _MultiStarts(self.file_indices[idx], self.local_starts[idx])
+        return _MultiStarts(
+            self.file_indices[idx],
+            self.local_starts[idx],
+            self.episode_indices[idx],
+        )
+
+    def split_by_episode(
+        self,
+        val_fraction: float,
+        seed: int,
+    ) -> tuple[_MultiStarts, _MultiStarts]:
+        """Split starts without placing overlapping windows from one episode
+        in both train and validation sets.
+
+        Episodes are shuffled deterministically, then the requested fraction
+        of whole episodes is assigned to validation. At least one episode is
+        retained for each split. Using episode count (rather than window
+        count) keeps Stage A and Stage B on the same split even when their
+        window lengths differ.
+        """
+        if not 0.0 < val_fraction < 1.0:
+            raise ValueError(f"val_fraction must be in (0, 1), got {val_fraction}")
+        if self.size == 0:
+            raise ValueError("cannot split an empty set of sequence starts")
+
+        episode_keys = np.stack(
+            [self.file_indices.astype(np.int64), self.episode_indices.astype(np.int64)],
+            axis=1,
+        )
+        unique_episodes, inverse = np.unique(
+            episode_keys, axis=0, return_inverse=True
+        )
+        if unique_episodes.shape[0] < 2:
+            raise ValueError(
+                "episode-disjoint validation requires at least two episodes"
+            )
+
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(unique_episodes.shape[0])
+        n_val_episodes = min(
+            unique_episodes.shape[0] - 1,
+            max(1, int(round(unique_episodes.shape[0] * val_fraction))),
+        )
+        val_mask = np.isin(inverse, order[:n_val_episodes])
+        return self[~val_mask], self[val_mask]
 
 
 class DataReader:
@@ -643,13 +704,64 @@ class DataReader:
         self._files: list[h5py.File] = [h5py.File(str(p), "r") for p in h5_paths]
         self._paths: list[str] = [str(p) for p in h5_paths]
         self._sizes: list[int] = [f["action"].shape[0] for f in self._files]
+        try:
+            for path_str, replay in zip(self._paths, self._files, strict=True):
+                self._validate_integrity(Path(path_str), replay)
+        except Exception:
+            self.close()
+            raise
+
+    @staticmethod
+    def _validate_integrity(path: Path, replay: h5py.File) -> None:
+        if bool(replay.attrs.get("writer_active", 0)):
+            raise RuntimeError(
+                f"{path} is still open for writing; finish data collection "
+                "before training"
+            )
+        required = ("action", "reward", "done", "episode_starts")
+        missing = [key for key in required if key not in replay]
+        if missing:
+            raise RuntimeError(f"{path} is missing required datasets: {missing}")
+
+        n = replay["action"].shape[0]
+        if n == 0:
+            raise RuntimeError(f"{path} contains no transitions")
+        for key in ("reward", "done"):
+            if replay[key].shape[0] != n:
+                raise RuntimeError(
+                    f"{path} has inconsistent lengths: action={n}, "
+                    f"{key}={replay[key].shape[0]}"
+                )
+        starts = replay["episode_starts"][:]
+        if starts.size == 0 or starts[0] != 0 or np.any(np.diff(starts) <= 0):
+            raise RuntimeError(f"{path} has invalid episode_starts")
+        if starts[-1] >= n or replay["done"][n - 1] != 1:
+            raise RuntimeError(
+                f"{path} has an unfinished final episode; finish/close collection "
+                "before training"
+            )
+
+        if "obs/own/hp" in replay and "obs/opp/hp" in replay:
+            sample_n = min(n, 20_000)
+            own_hp = replay["obs/own/hp"][:sample_n]
+            opp_hp = replay["obs/opp/hp"][:sample_n]
+            if sample_n > 1:
+                own_change_rate = float(np.mean(own_hp[1:] != own_hp[:-1]))
+                lag_swap_rate = float(np.mean(own_hp[1:] == opp_hp[:-1]))
+                if own_change_rate > 0.2 and lag_swap_rate > 0.5:
+                    raise RuntimeError(
+                        f"{path} has interleaved player perspectives "
+                        f"(own HP change={own_change_rate:.3f}, "
+                        f"own[t]==opp[t-1]={lag_swap_rate:.3f}); exclude or "
+                        "re-collect this file"
+                    )
 
     def close(self) -> None:
         for f in self._files:
             f.close()
         self._files.clear()
 
-    def __enter__(self) -> "DataReader":
+    def __enter__(self) -> DataReader:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -688,14 +800,43 @@ class DataReader:
         """
         all_fi: list[np.ndarray] = []
         all_local: list[np.ndarray] = []
+        all_episode: list[np.ndarray] = []
         for i, f in enumerate(self._files):
             local = valid_seq_starts(f, seq_len, stride)
             if local.size > 0:
+                episode_starts = f["episode_starts"][:]
                 all_fi.append(np.full(local.size, i, dtype=np.int32))
                 all_local.append(local)
+                all_episode.append(
+                    np.searchsorted(episode_starts, local, side="right").astype(np.int32)
+                    - 1
+                )
         if not all_fi:
-            return _MultiStarts(np.array([], dtype=np.int32), np.array([], dtype=np.int64))
-        return _MultiStarts(np.concatenate(all_fi), np.concatenate(all_local))
+            return _MultiStarts(
+                np.array([], dtype=np.int32),
+                np.array([], dtype=np.int64),
+                np.array([], dtype=np.int32),
+            )
+        return _MultiStarts(
+            np.concatenate(all_fi),
+            np.concatenate(all_local),
+            np.concatenate(all_episode),
+        )
+
+    def terminal_ending_starts(
+        self,
+        starts: _MultiStarts,
+        seq_len: int,
+        stride: int = 1,
+    ) -> _MultiStarts:
+        """Return windows whose final sampled observation is terminal."""
+        endpoint_offset = (seq_len - 1) * stride
+        keep = np.zeros(starts.size, dtype=bool)
+        for fi in np.unique(starts.file_indices):
+            mask = starts.file_indices == fi
+            endpoints = starts.local_starts[mask] + endpoint_offset
+            keep[mask] = self._files[int(fi)]["done"][endpoints].astype(bool)
+        return starts[keep]
 
     def sample_window(
         self,

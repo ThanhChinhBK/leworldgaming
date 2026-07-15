@@ -95,8 +95,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pace", default="sync", choices=["sync", "realtime"],
                    help="sync: game waits for the agent (predict-only quality). "
                         "realtime: enforce the per-decision frame budget (overall quality).")
-    p.add_argument("--frame-skip", type=int, default=1,
-                   help="decide every N frames; the action repeats for N (action-repeat)")
+    p.add_argument("--frame-skip", type=int, default=None,
+                   help="decide every N frames; defaults to the LeWM checkpoint's "
+                        "temporal_stride for LeWM and 1 for other agents")
     p.add_argument("--obs-mode", default="auto", choices=["auto", "state", "pixel"],
                    help="auto: pixel for lewm, state otherwise")
     p.add_argument("--image-size", type=int, default=224)
@@ -117,6 +118,17 @@ def main() -> None:
         obs_mode = "pixel" if args.agent.lower() == "lewm" else "state"
 
     agent = build_agent(args.agent, args.ckpt, args.device)
+    if args.agent.lower() == "lewm":
+        expected_stride = int(agent.temporal_stride)
+        if args.frame_skip is None:
+            args.frame_skip = expected_stride
+        elif args.frame_skip != expected_stride:
+            raise SystemExit(
+                f"LeWM checkpoint was trained with temporal_stride={expected_stride}, "
+                f"but --frame-skip={args.frame_skip}. These must match."
+            )
+    elif args.frame_skip is None:
+        args.frame_skip = 1
 
     env = FightingIceEnv(EnvConfig(
         host=args.host, port=args.port, character=args.character,
@@ -136,6 +148,8 @@ def main() -> None:
             obs, info = env.reset()
             if obs is None:  # match over
                 break
+            if hasattr(agent, "reset_episode"):
+                agent.reset_episode()
             ep_reward = 0.0
             last_action = 0  # NEUTRAL fallback if the very first decision is late
             done = False

@@ -13,7 +13,7 @@ Three helpers:
 * ``sample_sequence_batch(f, valid_starts, batch_size, seq_len, rng)`` —
   fancy-indexed ``(B, T, ...)`` batch of pixels and actions.
 * ``to_device_seq(pixels_np, actions_np, action_dim, device)`` — move to
-  device, normalise pixels to ``[-1, 1]``, one-hot the actions.
+  device, apply the reference ImageNet normalization, one-hot the actions.
 
 Kept as free functions (not a class) so the existing ``train_lewm.py``
 call-sites can swap to imports with no other refactor.
@@ -25,6 +25,8 @@ import h5py
 import numpy as np
 import torch
 from torch import nn
+
+from leworldgaming.utils.image import normalize_imagenet_pixels
 
 
 def valid_seq_start_indices(f: h5py.File, seq_len: int) -> np.ndarray:
@@ -105,7 +107,7 @@ def to_device_seq(
     device: torch.device,
     stride: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Move pixels (``[-1, 1]`` normalised float32) and one-hot actions to ``device``.
+    """Move ImageNet-normalized pixels and one-hot actions to ``device``.
 
     ``stride`` (temporal frameskip): when >1, ``actions_np`` is expected to be
     the FULL raw (un-subsampled) span of shape ``(B, (steps)*stride[+1])`` —
@@ -116,30 +118,37 @@ def to_device_seq(
     predictor needs to know everything that happened during the skipped
     frames, not just a single snapshot action).
     """
-    pixels = (
-        torch.from_numpy(pixels_np).to(device, dtype=torch.float32).div_(127.5).sub_(1.0)
-    )
+    pixels = normalize_imagenet_pixels(torch.from_numpy(pixels_np).to(device))
     actions = torch.from_numpy(actions_np.astype(np.int64)).to(device)
     a_oh_raw = nn.functional.one_hot(actions, num_classes=action_dim).float()
-    if stride == 1:
-        return pixels, a_oh_raw
     b, span = actions.shape
-    steps = span // stride
+    if stride < 1 or (span - 1) % stride != 0:
+        raise ValueError(
+            f"action span {span} must equal steps * stride + 1 for stride={stride}"
+        )
+    steps = (span - 1) // stride
     a_oh = a_oh_raw[:, : steps * stride].reshape(b, steps, stride * action_dim)
     return pixels, a_oh
 
 
 def reduce_reward_seq(rewards_raw: torch.Tensor, stride: int) -> torch.Tensor:
-    """Sum raw per-frame rewards into one value per ``stride``-sized block.
+    """Align recorded rewards to action blocks and sum each block.
 
-    ``rewards_raw``: ``(B, span)`` full raw span (see ``_RAW_STRIDE_KEYS``).
-    Returns ``(B, steps)`` where ``steps = span // stride`` — the reward
-    earned while executing one step's action-block, matching the frameskip
-    convention where a "step" covers ``stride`` raw environment frames.
-    ``stride=1`` returns the input unchanged (steps == span).
+    The recorder stores observation ``s[t]`` and the HP delta that arrived
+    *into* that observation in the same row, while ``action[t]`` is chosen
+    from ``s[t]`` and affects later rows. Therefore an action block covering
+    raw actions ``[t, t+stride)`` owns reward rows ``[t+1, t+stride+1)``.
+
+    ``rewards_raw`` must contain one endpoint row beyond the action span:
+    shape ``(B, steps * stride + 1)``. The result has shape ``(B, steps)``.
     """
-    if stride == 1:
-        return rewards_raw
+    if stride < 1:
+        raise ValueError(f"stride must be >= 1, got {stride}")
     b, span = rewards_raw.shape
-    steps = span // stride
-    return rewards_raw[:, : steps * stride].reshape(b, steps, stride).sum(dim=-1)
+    if (span - 1) % stride != 0:
+        raise ValueError(
+            f"reward span {span} must equal steps * stride + 1 for stride={stride}"
+        )
+    steps = (span - 1) // stride
+    aligned = rewards_raw[:, 1 : 1 + steps * stride]
+    return aligned.reshape(b, steps, stride).sum(dim=-1)

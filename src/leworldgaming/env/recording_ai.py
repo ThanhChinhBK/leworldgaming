@@ -51,6 +51,7 @@ class RecordingAI(AIInterface):
         self._key = Key()
         self._frame_data = FrameData()
         self._player_number = False
+        self._active_action = Action.NEUTRAL
         self._max_hp = 400.0
         self._max_energy = 300.0
         self._prev_hp_self: int | None = None
@@ -72,6 +73,8 @@ class RecordingAI(AIInterface):
 
     def initialize(self, game_data: GameData, player_number: bool) -> None:
         self._player_number = player_number
+        self._active_action = Action.NEUTRAL
+        self._cc.skill_cancel()
         idx = 0 if player_number else 1
         self._max_hp = float(game_data.max_hps[idx]) if game_data.max_hps else 400.0
         self._max_energy = (
@@ -104,6 +107,26 @@ class RecordingAI(AIInterface):
         pass
 
     def processing(self) -> None:
+        # pyftg's AIController runs this via loop.run_in_executor() with no
+        # exception handling at all: if this method ever raises, the
+        # AIController's asyncio task dies silently, its socket to the JVM is
+        # never closed, and the JVM's SocketPlayer thread blocks forever in
+        # socketRecv waiting for a key that will never come — the main thread
+        # then hangs in ThreadController.resetAllObjects waiting on that
+        # player, freezing the whole game with no error surfaced anywhere.
+        # Any unexpected exception here must therefore be caught and turned
+        # into a safe no-op key instead of killing the connection.
+        try:
+            self._process_frame()
+        except Exception:
+            logger.exception(
+                "[%s] processing() raised — sending NEUTRAL to avoid stalling "
+                "the JVM connection",
+                self._name,
+            )
+            self._key = Key()
+
+    def _process_frame(self) -> None:
         if self._frame_data.empty_flag or self._frame_data.current_frame_number < 0:
             self._key = Key()
             return
@@ -114,7 +137,14 @@ class RecordingAI(AIInterface):
             self._key = Key()
             return
 
-        action: Action = self._policy(self._frame_data, self._player_number)
+        requested_action: Action = self._policy(
+            self._frame_data, self._player_number
+        )
+        self._cc.set_frame_data(self._frame_data, self._player_number)
+        if not self._cc.get_skill_flag():
+            self._cc.command_call(requested_action.name)
+            self._active_action = requested_action
+        action = self._active_action
 
         if self._record and self._buffer is not None:
             obs = frame_to_obs_dict(
@@ -143,9 +173,6 @@ class RecordingAI(AIInterface):
             self._prev_hp_opp = opp.hp
             self._steps_in_episode += 1
 
-        self._cc.set_frame_data(self._frame_data, self._player_number)
-        if not self._cc.get_skill_flag():
-            self._cc.command_call(action.name)
         self._key = self._cc.get_skill_key()
 
     def input(self) -> Key:
@@ -158,6 +185,8 @@ class RecordingAI(AIInterface):
         steps = self._steps_in_episode
         self._prev_hp_self = None
         self._prev_hp_opp = None
+        self._active_action = Action.NEUTRAL
+        self._cc.skill_cancel()
         self._steps_in_episode = 0
         buf_len = len(self._buffer) if self._buffer else 0
         buf_eps = self._buffer.num_episodes if self._buffer else 0

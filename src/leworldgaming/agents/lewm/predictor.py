@@ -114,8 +114,8 @@ class Predictor(nn.Module):
 
     def __init__(
         self,
-        latent_dim: int = 256,
-        action_dim: int = 256,  # action *embedding* dim — matches latent_dim
+        latent_dim: int = 192,
+        action_dim: int = 192,  # action *embedding* dim — matches latent_dim
         history_size: int = 3,
         depth: int = 6,
         num_heads: int = 16,
@@ -132,7 +132,7 @@ class Predictor(nn.Module):
             )
         self.latent_dim = latent_dim
         self.history_size = history_size
-        self.pos_embedding = nn.Parameter(torch.randn(1, history_size, latent_dim) * 0.02)
+        self.pos_embedding = nn.Parameter(torch.randn(1, history_size, latent_dim))
         self.dropout = nn.Dropout(emb_dropout)
         self.blocks = nn.ModuleList(
             [_ConditionalBlock(latent_dim, num_heads, dim_head, mlp_dim, dropout) for _ in range(depth)]

@@ -45,7 +45,7 @@ def main() -> None:
                              "Supported by lewm (stage a/b), dreamer, and pets.")
     parser.add_argument("--resume", action="store_true", default=None,
                         help="Resume from the existing checkpoint (Stage A: --ckpt-path, "
-                             "Stage B: --ckpt-in/config ckpt_out, dreamer/pets: --ckpt-path) "
+                             "Stage B: --ckpt-path/config ckpt_out, dreamer/pets: --ckpt-path) "
                              "if present; --steps is the TOTAL target step count.")
     args = parser.parse_args()
 

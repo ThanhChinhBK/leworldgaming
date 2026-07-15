@@ -1,5 +1,5 @@
 # Architecture
-latent_dim: 256
+latent_dim: 192
 action_dim: 56
 projector_hidden: 2048
 history_size: 3
@@ -17,7 +17,7 @@ temporal_stride: 5
 # Encoder (ViT-tiny: depth=12, dim=192, heads=3, mlp_ratio=4).
 # Drop encoder_depth to 6 for fast MPS iteration.
 encoder_image_size: 224
-encoder_patch_size: 16
+encoder_patch_size: 14
 encoder_embed_dim: 192
 encoder_depth: 12
 encoder_heads: 3
@@ -32,13 +32,13 @@ predictor_mlp_dim: 2048
 predictor_dropout: 0.1
 
 # Optimization
-batch_size: 16
-lr: 3.0e-4
+batch_size: 128
+lr: 5.0e-5
 weight_decay: 1.0e-3
 grad_clip: 1.0
 
 # Loss
-sigreg_lambda: 0.1
+sigreg_lambda: 0.09
 sigreg_knots: 17
 sigreg_num_proj: 1024
 
@@ -50,13 +50,13 @@ val_split: 0.1
 val_every: 1000
 val_batches: 8        # cap validation batches per eval (0 = full val set)
 ckpt_every: 1000      # save a checkpoint every N steps (0 = only at end)
-seed: 0
+seed: 3072
 
 # Inference-time planner (not used by train_lewm.py)
 # NOTE: with temporal_stride=5 above, planner.horizon=5 steps now covers
 # 5*5=25 raw frames (~417ms) — matching the paper's real-time lookahead.
-# planner.py / play.py still need to be updated separately to hold each
-# planned action for `temporal_stride` raw frames at rollout time.
+# play.py enforces frame_skip == temporal_stride; planner action blocks repeat
+# each selected high-level action across those raw frames.
 planner:
   horizon: 5
   num_samples: 64

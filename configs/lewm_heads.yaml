@@ -10,15 +10,16 @@ heads:
   value_low: -10.0
   value_high: 10.0
   hidden_dim: 512
-  imagined_horizon: 5      # M4: enabled.
+  imagined_horizon: 0      # M2: reward+cont only.
   lambda_return: 0.95
   gamma: 0.997
   target_ema: 0.99
   reward_loss_weight: 1.0
   cont_loss_weight: 1.0
-  value_loss_weight: 0.5  # M3: enabled.
-  imagined_loss_weight: 1.0  # M4: enabled.
-  probe_loss_weight: 0.1  # M5: enabled.
+  value_loss_weight: 0.0  # M3: not yet.
+  imagined_loss_weight: 0.0  # M4: not yet.
+  probe_loss_weight: 0.0  # M5: not yet.
+  terminal_window_fraction: 0.1  # Ensure continuation sees terminal states.
 
 # Optimization (separate from Stage-A optimizer)
 batch_size: 16
@@ -28,8 +29,8 @@ grad_clip: 1.0
 
 # I/O
 data_path: /media/jeovach/New Volume/leworldgaming
-ckpt_in: data/lewm_checkpoint.pt
-ckpt_out: data/lewm_heads_checkpoint.pt
+ckpt_in: data/lewm_checkpoint_stride5.pt
+ckpt_out: data/lewm_heads_checkpoint_stride5.pt
 log_every: 10
 val_split: 0.1
 val_every: 1000
