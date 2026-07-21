@@ -107,6 +107,7 @@ def _empty_char_dict() -> dict[str, Any]:
         "atk_active": np.int16(0),
         "atk_hit_damage": np.int16(0),
         "atk_type": np.int8(0),
+        "action": np.int32(0),  # NEUTRAL
     }
 
 
@@ -145,6 +146,8 @@ def _encode_character_dict(char) -> dict[str, Any]:
         "atk_active": np.int16(active),
         "atk_hit_damage": np.int16(hit_damage),
         "atk_type": np.int8(atype),
+        "action": np.int32(getattr(char, "action", None).to_int()
+                            if getattr(char, "action", None) is not None else 0),
     }
 
 
@@ -161,7 +164,8 @@ def frame_to_obs_dict(
         {
             "own": {hp, energy, x, y, speed_x, speed_y, state, front, control,
                     remaining_frame, hit_confirm,
-                    atk_is_live, atk_start_up, atk_active, atk_hit_damage, atk_type},
+                    atk_is_live, atk_start_up, atk_active, atk_hit_damage,
+                    atk_type, action},
             "opp": {... same fields ...},
             "global": {current_round, current_frame, proj_self, proj_opp,
                        max_hp, max_energy},

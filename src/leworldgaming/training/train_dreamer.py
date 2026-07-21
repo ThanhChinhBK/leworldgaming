@@ -4,9 +4,11 @@ Reads the canonical replay HDF5 (named-group schema), exports it to a
 directory of per-episode ``.npz`` files in the format the vendored
 ``external/dreamerv3-torch`` trainer expects, then drives that trainer's
 ``WorldModel`` + ``ImagBehavior`` purely from the offline dataset (no live
-env, no rollouts). ``act()`` for online play is deferred until the
-``FightingIceEnv`` sync wrapper is built — see plan in
-``docs/gemini_research.md`` §7.1.
+env, no rollouts). Online play (``DreamerAgent.act()``) is implemented in
+``leworldgaming.agents.dreamer.agent`` and driven live via
+``scripts/play.py --agent dreamer``; ``build_agent_for_inference`` below
+reconstructs the upstream module stack from a saved checkpoint without
+needing exported episodes.
 
 Mirrors ``train_lewm.train`` shape: same DEFAULTS-merge-with-YAML-then-overrides
 config pattern, same logger format, same checkpoint layout.
@@ -14,7 +16,6 @@ config pattern, same logger format, same checkpoint layout.
 
 from __future__ import annotations
 
-import sys
 import time
 from argparse import Namespace
 from pathlib import Path
@@ -147,6 +148,78 @@ def _build_dreamer_config(cfg: dict[str, Any], device: torch.device) -> Namespac
     return Namespace(**merged)
 
 
+def _patch_upstream_mlp_device(dreamer_networks: Any, device: torch.device) -> None:
+    """Fix upstream MLP default device — safe to call multiple times.
+
+    ``MultiEncoder`` constructs its MLP without passing ``device``, so MLP
+    falls back to its hardcoded ``device="cuda"`` (networks.py:606) and
+    crashes on non-CUDA hosts at ``torch.tensor((std,), device=device)``
+    (line 615). In pixel mode this was never hit because
+    ``mlp_keys='$^'`` skipped MLP construction; proprio mode hits it on
+    every run. Substitute our actual device for the "cuda" default;
+    explicit ``device=`` calls pass through unchanged.
+    """
+    if getattr(dreamer_networks.MLP, "_lwg_patched", False):
+        return
+    _orig_mlp_init = dreamer_networks.MLP.__init__
+    _target_device = str(device)
+
+    def _patched_mlp_init(self, *args, device="cuda", **kwargs):  # noqa: ANN001
+        if device == "cuda" and _target_device != "cuda":
+            device = _target_device
+        return _orig_mlp_init(self, *args, device=device, **kwargs)
+
+    dreamer_networks.MLP.__init__ = _patched_mlp_init
+    dreamer_networks.MLP._lwg_patched = True
+
+
+def build_agent_for_inference(
+    ckpt_path: str | Path, device: str | torch.device | None = None,
+) -> DreamerAgent:
+    """Reconstruct a ready-to-``act()`` ``DreamerAgent`` from a checkpoint.
+
+    Unlike ``train()``, this never touches ``data_path``/``episode_dir`` —
+    it only needs the checkpoint's saved flat config (``state_dim``,
+    ``num_actions``, ``obs_mode``, ...) to rebuild the obs/act spaces and
+    the upstream ``Dreamer`` module shape, then loads the saved weights.
+    Used by ``scripts/play.py --agent dreamer`` for live/offline evaluation
+    without requiring exported ``.npz`` episodes to exist.
+    """
+    resolved_device = torch.device(device) if device else best_device()
+    ckpt = torch.load(Path(ckpt_path), map_location=resolved_device, weights_only=False)
+    cfg = dict(DEFAULTS)
+    cfg.update({k: v for k, v in ckpt["config"].items() if k in DEFAULTS})
+
+    import dreamer as dreamer_mod  # noqa: E402  — sys.path extended at import time
+    import networks as dreamer_networks  # noqa: E402
+    import tools as dreamer_tools  # noqa: E402
+
+    _patch_upstream_mlp_device(dreamer_networks, resolved_device)
+
+    obs_space = make_obs_space(
+        int(cfg["state_dim"]), obs_mode=cfg.get("obs_mode", "vector"),
+        image_size=int(cfg.get("image_size", 64)),
+    )
+    act_space = make_action_space(int(cfg["num_actions"]))
+    dreamer_cfg = _build_dreamer_config(cfg, resolved_device)
+
+    logdir = Path(cfg["logdir"])
+    logdir.mkdir(parents=True, exist_ok=True)
+    logger = dreamer_tools.Logger(logdir, step=0)
+
+    # No live/offline dataset needed for inference — ``Dreamer.__call__``
+    # only calls ``next(self._dataset)`` when ``training=True``, and
+    # ``act()`` always calls with ``training=False``.
+    agent_module = dreamer_mod.Dreamer(
+        obs_space, act_space, dreamer_cfg, logger, dataset=None,
+    ).to(resolved_device)
+    agent_module.requires_grad_(requires_grad=False)
+    agent_module.load_state_dict(ckpt["agent_state_dict"])
+    agent_module.eval()
+
+    return DreamerAgent(agent_module, dreamer_cfg, resolved_device)
+
+
 def train(
     num_steps: int = 1000,
     config_path: str | Path | None = "configs/dreamer.yaml",
@@ -195,24 +268,7 @@ def train(
     import networks as dreamer_networks  # noqa: E402
     import tools as dreamer_tools  # noqa: E402
 
-    # Fix upstream MLP default device. ``MultiEncoder`` constructs its MLP
-    # without passing ``device``, so MLP falls back to its hardcoded
-    # ``device="cuda"`` (networks.py:606) and crashes on non-CUDA hosts at
-    # ``torch.tensor((std,), device=device)`` (line 615). In pixel mode this
-    # was never hit because mlp_keys='$^' skipped MLP construction; proprio
-    # mode hits it on every run. Substitute our actual device for the
-    # "cuda" default; explicit device= calls pass through unchanged.
-    if not getattr(dreamer_networks.MLP, "_lwg_patched", False):
-        _orig_mlp_init = dreamer_networks.MLP.__init__
-        _target_device = str(device)
-
-        def _patched_mlp_init(self, *args, device="cuda", **kwargs):  # noqa: ANN001
-            if device == "cuda" and _target_device != "cuda":
-                device = _target_device
-            return _orig_mlp_init(self, *args, device=device, **kwargs)
-
-        dreamer_networks.MLP.__init__ = _patched_mlp_init
-        dreamer_networks.MLP._lwg_patched = True
+    _patch_upstream_mlp_device(dreamer_networks, device)
 
     obs_space = make_obs_space(
         state_dim,

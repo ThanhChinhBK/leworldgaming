@@ -1,0 +1,70 @@
+# Stage-B head trainer config, milestone M4: adds imagined-rollout
+# reward/continuation supervision (M4) and value-head bootstrapping (M3)
+# on top of the M2 baseline (configs/lewm_heads.yaml).
+#
+# Root cause: the M2 checkpoint's reward_head/continuation_head were only
+# ever trained on GROUNDED (real encoder) latents, but the CEM/random
+# planner scores multi-step rollouts using the frozen predictor's IMAGINED
+# latents beyond the first planning step. That's a total train/inference
+# distribution mismatch -- the reward head silently extrapolates on latents
+# it has never seen, which a CEM-style planner will happily exploit
+# ("model exploitation", a well-known MBRL failure mode). This config
+# enables the already-implemented (but previously zero-weighted) imagined
+# rollout branch in train_lewm_heads.py so the heads are calibrated on the
+# predictor's own imagined trajectories, plus adds a value head so planning
+# gets bootstrapped value beyond the horizon instead of a bare finite-sum.
+#
+# Same replay data, same Stage-A encoder/predictor (frozen) -- no data
+# recollection, no Stage-A retrain.
+
+heads:
+  reward_bins: 41
+  reward_low: -1.0
+  reward_high: 1.0
+  value_bins: 41
+  value_low: -10.0
+  value_high: 10.0
+  hidden_dim: 512
+  imagined_horizon: 5      # M4: matches planner default horizon.
+  lambda_return: 0.95
+  gamma: 0.997
+  target_ema: 0.99
+  reward_loss_weight: 1.0
+  cont_loss_weight: 1.0
+  value_loss_weight: 1.0      # M3: enabled.
+  imagined_loss_weight: 1.0   # M4: enabled.
+  probe_loss_weight: 0.0      # unused (reward_head present).
+  terminal_window_fraction: 0.1
+  # 2026-07-19: continuation head overfits its ~300 train terminal-window
+  # examples fast (val BCE observed 0.55->4.7 over 20k steps while train
+  # stays ~0.06-0.6). Dropout slows that down; the trainer also snapshots
+  # the lowest-val_loss_c continuation-head weights and swaps them into the
+  # final checkpoint regardless of this value (see train_lewm_heads.py).
+  #
+  # 2026-07-20 v3 iteration: dropout=0.2 alone did NOT fix it -- a full 20k
+  # retrain (lewm_heads_checkpoint_stride2_m4_v2.pt) showed val_loss_c
+  # climbing monotonically from step 0 (0.70) to step 20000 (3.63), i.e. it
+  # never improved even once, so the best-val snapshot just shipped the
+  # undertrained step-0 head. Escalating: shrink the head's capacity
+  # (cont_hidden_dim, independent of the shared 512-wide reward/value
+  # heads) and add head-specific weight decay, on top of higher dropout.
+  cont_dropout: 0.35
+  cont_hidden_dim: 64
+
+# Optimization (separate from Stage-A optimizer)
+batch_size: 16
+lr: 3.0e-4
+weight_decay: 1.0e-3
+cont_weight_decay: 0.05
+grad_clip: 1.0
+
+# I/O
+data_path: /media/jeovach/New Volume/leworldgaming
+ckpt_in: data/lewm_checkpoint_stride5.pt
+ckpt_out: data/lewm_heads_checkpoint_stride5_m4_v3.pt
+log_every: 10
+val_split: 0.1
+val_every: 1000
+val_batches: 8
+ckpt_every: 1000
+seed: 0

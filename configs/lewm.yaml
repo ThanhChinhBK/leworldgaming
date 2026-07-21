@@ -9,10 +9,24 @@ history_size: 3
 # frameskip=5 for both data + planning; this repo previously used stride=1,
 # meaning its 5-step planning horizon only covered 5 raw frames (~83ms at
 # 60fps) instead of the paper's 25 raw frames (~417ms) — too short to see
-# most special-attack startup/active windows. stride=5 matches the paper:
-# each step's observation is the frame at the block's start, and its action
-# is the concatenation of all 5 raw one-hot actions inside the block.
-temporal_stride: 5
+# most special-attack startup/active windows. stride=5 matched the paper,
+# but in live matches vs Dreamer (60Hz native decision rate) it left LeWM
+# re-deciding only every 5 raw frames (12Hz) — a 5x reaction-speed
+# disadvantage no amount of inference-time planner tuning can close (the
+# predictor only knows how to jump `stride` raw frames per step). An
+# equal-decision-rate ablation (Dreamer forced to --frame-skip 5) showed
+# LeWM can actually outperform Dreamer's world model at matched cadence —
+# it's purely being out-paced, not out-planned. stride=2 is a deliberate
+# middle ground: reaction rate improves 12Hz -> 30Hz while only tightening
+# the per-decision latency budget 2x (vs 5x for stride=1), letting the CEM
+# latency-budget work already done for stride=5 (see planner section below
+# and agent.py's _build_modules) mostly carry over instead of being erased
+# by an unaffordable budget. See
+# docs/lewm_stride2_retrain_decision_2026-07-17.md for the full analysis of
+# why stride=1 was rejected (needs horizon=40 to keep the same lookahead,
+# which forces the CEM sample count down to ~2-4 -- too shallow to search
+# meaningfully) and why stride=2 was chosen instead.
+temporal_stride: 2
 
 # Encoder (ViT-tiny: depth=12, dim=192, heads=3, mlp_ratio=4).
 # Drop encoder_depth to 6 for fast MPS iteration.
@@ -52,11 +66,23 @@ val_batches: 8        # cap validation batches per eval (0 = full val set)
 ckpt_every: 1000      # save a checkpoint every N steps (0 = only at end)
 seed: 3072
 
-# Inference-time planner (not used by train_lewm.py)
-# NOTE: with temporal_stride=5 above, planner.horizon=5 steps now covers
-# 5*5=25 raw frames (~417ms) — matching the paper's real-time lookahead.
+# Inference-time planner (NOT used by train_lewm.py -- train_lewm's
+# DEFAULTS dict has no "planner" key, so this section is documentation-only:
+# it's never parsed into the checkpoint's saved config or read back by
+# LewmAgent._build_modules. Real planner defaults live in
+# src/leworldgaming/agents/lewm/agent.py's _build_modules and must be
+# updated there by hand after a stride change -- see
+# docs/lewm_stride2_retrain_decision_2026-07-17.md).
+#
+# With temporal_stride=2 above, horizon=10-12 covers ~20-24 raw frames
+# (~330-400ms) -- close to the paper's ~417ms reference lookahead, while
+# only needing ~2x (not 5x) more predictor-rollout compute than the
+# stride=5 config this replaced. Recommended starting point once a
+# stride=2 checkpoint exists: samples=16, iters=1, horizon=10 (~32ms/decision
+# measured-equivalent at stride=5 timings -- re-benchmark on real hardware,
+# since exact costs may shift slightly with the new checkpoint).
 # play.py enforces frame_skip == temporal_stride; planner action blocks repeat
 # each selected high-level action across those raw frames.
 planner:
-  horizon: 5
-  num_samples: 64
+  horizon: 10
+  num_samples: 16

@@ -78,14 +78,39 @@ DEFAULTS: dict[str, Any] = {
         "imagined_loss_weight": 0.0,
         "probe_loss_weight": 0.0,
         "terminal_window_fraction": 0.1,
+        # Continuation head only: dropout to fight the chronic val-loss
+        # blowup on the ~300 (train) terminal-window examples (see
+        # ContinuationHead docstring). 0.0 preserves old behavior exactly.
+        "cont_dropout": 0.0,
+        # Continuation head only: optional smaller hidden width. None means
+        # "use the shared heads.hidden_dim" (old behavior). With only ~300
+        # train / ~34 val terminal windows, the shared 512-wide MLP has far
+        # more capacity than the data supports and memorizes those few
+        # examples; shrinking just this head reduces that capacity without
+        # touching reward/value heads, which have plenty of (non-terminal)
+        # training signal and benefit from the larger width.
+        "cont_hidden_dim": None,
         # Indices into the legacy 52-dim state_vector to use as probe targets.
         # Default matches planner.py:64 convention: probe[..., 0] = HP-diff.
         # 47 = hp_diff (signed), 0 = hp_self, 22 = hp_opp, 46 = distance.
         "probe_targets": [47, 0, 22, 46],
+        # Reward/value head ensembling (2026-07-20): train N independently
+        # -initialized heads instead of one so the CEM planner can score
+        # trajectories with mean-minus-uncertainty instead of a single
+        # head's point estimate (see planner._decode_pessimistic). Targets
+        # the "model exploitation" failure mode this config's own docstring
+        # already anticipated. 1 = old behavior exactly (single head, saved
+        # under the singular "reward_head"/"value_head" checkpoint keys for
+        # full backward compatibility with LewmAgent/older checkpoints).
+        "reward_ensemble_size": 1,
+        "value_ensemble_size": 1,
     },
     "batch_size": 16,
     "lr": 3.0e-4,
     "weight_decay": 1.0e-3,
+    # Continuation head only: optional stronger weight decay param group.
+    # None means "use the shared weight_decay" (old behavior).
+    "cont_weight_decay": None,
     "grad_clip": 1.0,
     "data_path": "data/replay.h5",
     "ckpt_in": "data/lewm_checkpoint.pt",
@@ -205,6 +230,40 @@ def _lambda_return(
     return returns
 
 
+def _load_ensemble_or_singular(
+    modules: nn.ModuleList,
+    ckpt: dict[str, Any],
+    plural_key: str,
+    singular_key: str,
+) -> None:
+    """Load an ensemble's state dicts from a checkpoint.
+
+    Prefers the plural (list-of-state-dicts) key written by ensemble-aware
+    checkpoints. Falls back to the singular key (old, pre-ensembling
+    checkpoints, or ensemble_size==1) loaded into the first/only member —
+    keeps resuming from any pre-2026-07-20 Stage-B checkpoint working
+    unchanged.
+    """
+    if plural_key in ckpt:
+        saved = ckpt[plural_key]
+        if len(saved) != len(modules):
+            raise ValueError(
+                f"{plural_key} has {len(saved)} members in checkpoint but "
+                f"{len(modules)} were configured — ensemble size must match to resume."
+            )
+        for member, state in zip(modules, saved, strict=True):
+            member.load_state_dict(state)
+    elif singular_key in ckpt:
+        if len(modules) != 1:
+            raise ValueError(
+                f"Checkpoint only has a singular '{singular_key}' but "
+                f"{len(modules)} ensemble members were configured."
+            )
+        modules[0].load_state_dict(ckpt[singular_key])
+    else:
+        raise KeyError(f"Checkpoint has neither {plural_key!r} nor {singular_key!r}.")
+
+
 def train(
     num_steps: int = 1000,
     config_path: str | Path | None = "configs/lewm_heads.yaml",
@@ -243,12 +302,19 @@ def train(
             "value_high",
             "hidden_dim",
             "probe_targets",
+            "reward_ensemble_size",
+            "value_ensemble_size",
         )
         if saved_heads_config is not None:
+            ensemble_keys = ("reward_ensemble_size", "value_ensemble_size")
             changed_structure = [
                 key
                 for key in structural_head_keys
-                if saved_heads_config.get(key) != hcfg.get(key)
+                if (
+                    (saved_heads_config.get(key, 1) or 1) != (hcfg.get(key, 1) or 1)
+                    if key in ensemble_keys
+                    else saved_heads_config.get(key) != hcfg.get(key)
+                )
             ]
             if changed_structure:
                 raise ValueError(
@@ -285,29 +351,48 @@ def train(
     transition_len = history_size + max(1, imagined_horizon)
     state_len = transition_len + 1
 
-    reward_head = RewardHead(
-        latent_dim=latent_dim,
-        hidden_dim=int(hcfg["hidden_dim"]),
-        num_bins=int(hcfg["reward_bins"]),
+    n_reward = max(1, int(hcfg.get("reward_ensemble_size", 1) or 1))
+    n_value = max(1, int(hcfg.get("value_ensemble_size", 1) or 1))
+    reward_heads = nn.ModuleList(
+        [
+            RewardHead(
+                latent_dim=latent_dim,
+                hidden_dim=int(hcfg["hidden_dim"]),
+                num_bins=int(hcfg["reward_bins"]),
+            )
+            for _ in range(n_reward)
+        ]
     ).to(device)
     continuation_head = ContinuationHead(
         latent_dim=latent_dim,
-        hidden_dim=int(hcfg["hidden_dim"]),
+        hidden_dim=int(hcfg.get("cont_hidden_dim") or hcfg["hidden_dim"]),
+        dropout=float(hcfg.get("cont_dropout", 0.0)),
     ).to(device)
-    value_head = ValueHead(
-        latent_dim=latent_dim,
-        hidden_dim=int(hcfg["hidden_dim"]),
-        num_bins=int(hcfg["value_bins"]),
+    value_heads = nn.ModuleList(
+        [
+            ValueHead(
+                latent_dim=latent_dim,
+                hidden_dim=int(hcfg["hidden_dim"]),
+                num_bins=int(hcfg["value_bins"]),
+            )
+            for _ in range(n_value)
+        ]
     ).to(device)
-    value_target_head = ValueHead(
-        latent_dim=latent_dim,
-        hidden_dim=int(hcfg["hidden_dim"]),
-        num_bins=int(hcfg["value_bins"]),
+    value_target_heads = nn.ModuleList(
+        [
+            ValueHead(
+                latent_dim=latent_dim,
+                hidden_dim=int(hcfg["hidden_dim"]),
+                num_bins=int(hcfg["value_bins"]),
+            )
+            for _ in range(n_value)
+        ]
     ).to(device)
-    value_target_head.load_state_dict(value_head.state_dict())
-    for p in value_target_head.parameters():
-        p.requires_grad_(False)
-    value_target_head.eval()
+    for vh, vth in zip(value_heads, value_target_heads, strict=True):
+        vth.load_state_dict(vh.state_dict())
+        for p in vth.parameters():
+            p.requires_grad_(False)
+        vth.eval()
 
     probe_targets = list(hcfg["probe_targets"])
     probe = LinearProbe(latent_dim=latent_dim, target_dim=len(probe_targets)).to(device)
@@ -316,19 +401,34 @@ def train(
     value_bins = make_bins(int(hcfg["value_bins"]), float(hcfg["value_low"]), float(hcfg["value_high"]), device)
 
     head_modules = nn.ModuleDict({
-        "reward_head": reward_head,
+        "reward_heads": reward_heads,
         "continuation_head": continuation_head,
-        "value_head": value_head,
+        "value_heads": value_heads,
         "probe": probe,
     })
     n_params = sum(p.numel() for p in head_modules.parameters()) / 1e6
-    print(f"[train_lewm_heads] head params: {n_params:.2f}M (frozen JEPA: {sum(p.numel() for p in jepa['encoder'].parameters() if not p.requires_grad) / 1e6:.2f}M+ ...)")
+    print(f"[train_lewm_heads] head params: {n_params:.2f}M (reward_ensemble={n_reward} value_ensemble={n_value}) (frozen JEPA: {sum(p.numel() for p in jepa['encoder'].parameters() if not p.requires_grad) / 1e6:.2f}M+ ...)")
 
-    optim = torch.optim.AdamW(
-        head_modules.parameters(),
-        lr=float(cfg["lr"]),
-        weight_decay=float(cfg["weight_decay"]),
-    )
+    cont_wd = cfg.get("cont_weight_decay")
+    if cont_wd is None:
+        optim = torch.optim.AdamW(
+            head_modules.parameters(),
+            lr=float(cfg["lr"]),
+            weight_decay=float(cfg["weight_decay"]),
+        )
+    else:
+        # Separate param group so the (data-starved) continuation head can
+        # use stronger weight decay than reward/value/probe without
+        # affecting them.
+        cont_params = list(continuation_head.parameters())
+        other_params = [p for n, p in head_modules.named_parameters() if not n.startswith("continuation_head.")]
+        optim = torch.optim.AdamW(
+            [
+                {"params": other_params, "weight_decay": float(cfg["weight_decay"])},
+                {"params": cont_params, "weight_decay": float(cont_wd)},
+            ],
+            lr=float(cfg["lr"]),
+        )
 
     # Optional resume: load heads + optimizer state and continue from the
     # saved step. num_steps is the TOTAL target, so re-running the same command
@@ -338,10 +438,12 @@ def train(
     # architecture-changing head settings are rejected above.
     start_step = 0
     if resume_ckpt is not None:
-        reward_head.load_state_dict(resume_ckpt["reward_head"])
+        _load_ensemble_or_singular(reward_heads, resume_ckpt, "reward_heads", "reward_head")
         continuation_head.load_state_dict(resume_ckpt["continuation_head"])
-        value_head.load_state_dict(resume_ckpt["value_head"])
-        value_target_head.load_state_dict(resume_ckpt["value_target_head"])
+        _load_ensemble_or_singular(value_heads, resume_ckpt, "value_heads", "value_head")
+        _load_ensemble_or_singular(
+            value_target_heads, resume_ckpt, "value_target_heads", "value_target_head"
+        )
         probe.load_state_dict(resume_ckpt["probe"])
         if "optim" in resume_ckpt:
             optim.load_state_dict(resume_ckpt["optim"])
@@ -385,6 +487,26 @@ def train(
     history: list[dict[str, float]] = []
     val_history: list[dict[str, float]] = []
 
+    # Best-val continuation-head snapshot: the continuation head overfits
+    # its handful of terminal-window examples much faster than the other
+    # heads converge (val BCE observed climbing 0.55 -> 4.7 over 20k steps
+    # while train stays ~0.06-0.6), so training to num_steps and saving
+    # whatever the continuation head looks like *then* silently ships a
+    # badly miscalibrated head even though reward/value/probe kept
+    # improving over the same run. Track the step with the lowest
+    # val_loss_c and snapshot the continuation head's weights there; the
+    # final checkpoint swaps this snapshot in for continuation_head only,
+    # keeping the fully-converged final weights for the other heads.
+    best_val_loss_c = (
+        float(resume_ckpt.get("best_val_loss_c", float("inf")))
+        if resume_ckpt is not None else float("inf")
+    )
+    best_continuation_state: dict[str, torch.Tensor] = (
+        {k: v.clone() for k, v in resume_ckpt["best_continuation_head"].items()}
+        if resume_ckpt is not None and "best_continuation_head" in resume_ckpt
+        else {k: v.clone() for k, v in continuation_head.state_dict().items()}
+    )
+
     @torch.no_grad()
     def _encode_grounded(pixels: torch.Tensor) -> torch.Tensor:
         """(B, T, C, H, W) -> (B, T, D) post-projector embeddings, JEPA frozen."""
@@ -419,8 +541,13 @@ def train(
         a_emb = action_encoder(a_oh)                    # (B, T, D)
 
         # Reward block t is earned after taking action block t from z[t].
-        r_logits = reward_head(z, a_emb)                # (B, T, K)
-        loss_r = twohot_ce_loss(r_logits, rewards, reward_bins)
+        # Ensemble members share the batch but are otherwise independent —
+        # averaging each member's own CE loss trains them jointly with no
+        # cross-member gradient coupling (see planner._decode_pessimistic
+        # for how the resulting ensemble is scored at inference time).
+        loss_r = torch.stack(
+            [twohot_ce_loss(head(z, a_emb), rewards, reward_bins) for head in reward_heads]
+        ).mean()
 
         # Continuation is a state property. Include the endpoint so terminal
         # states are supervised, and balance terminal/nonterminal examples.
@@ -435,15 +562,18 @@ def train(
         loss_c_im_val = torch.zeros((), device=device)
 
         if w_v > 0.0:
-            v_logits = value_head(z)                     # (B, T, K_v)
-            with torch.no_grad():
-                v_tgt_logits = value_target_head(z_next)
-                next_values = twohot_decode(v_tgt_logits, value_bins)
-                next_cont = cont_target[:, 1:]
-                G = _lambda_return(
-                    rewards, next_cont, next_values, gamma=gamma, lam=lam
-                )
-            loss_v = twohot_ce_loss(v_logits, G, value_bins)
+            loss_v_per_member = []
+            for value_head, value_target_head in zip(value_heads, value_target_heads, strict=True):
+                v_logits = value_head(z)                  # (B, T, K_v)
+                with torch.no_grad():
+                    v_tgt_logits = value_target_head(z_next)
+                    next_values = twohot_decode(v_tgt_logits, value_bins)
+                    next_cont = cont_target[:, 1:]
+                    G = _lambda_return(
+                        rewards, next_cont, next_values, gamma=gamma, lam=lam
+                    )
+                loss_v_per_member.append(twohot_ce_loss(v_logits, G, value_bins))
+            loss_v = torch.stack(loss_v_per_member).mean()
             loss = loss + w_v * loss_v
             loss_v_val = loss_v.detach()
 
@@ -466,12 +596,16 @@ def train(
             # want gradients to flow into the heads. The predictor itself is
             # frozen and its weights aren't updated.
             a_emb_im = a_emb[:, history_size : history_size + K]    # (B, K, D)
-            r_logits_im = reward_head(z_im, a_emb_im)               # (B, K, R_bins)
-            loss_r_im = twohot_ce_loss(
-                r_logits_im,
-                rewards[:, history_size : history_size + K],
-                reward_bins,
-            )
+            loss_r_im = torch.stack(
+                [
+                    twohot_ce_loss(
+                        head(z_im, a_emb_im),
+                        rewards[:, history_size : history_size + K],
+                        reward_bins,
+                    )
+                    for head in reward_heads
+                ]
+            ).mean()
             c_logits_im = continuation_head(z_im)                   # (B, K)
             cont_im_target = 1.0 - dones[:, history_size : history_size + K].float()
             loss_c_im = _balanced_continuation_loss(c_logits_im, cont_im_target)
@@ -504,10 +638,11 @@ def train(
 
     @torch.no_grad()
     def _ema_update_target() -> None:
-        for p, p_tgt in zip(
-            value_head.parameters(), value_target_head.parameters(), strict=True
-        ):
-            p_tgt.data.mul_(target_ema).add_(p.data, alpha=1.0 - target_ema)
+        for value_head, value_target_head in zip(value_heads, value_target_heads, strict=True):
+            for p, p_tgt in zip(
+                value_head.parameters(), value_target_head.parameters(), strict=True
+            ):
+                p_tgt.data.mul_(target_ema).add_(p.data, alpha=1.0 - target_ema)
 
     with DataReader(cfg["data_path"]) as reader:
         valid_starts = reader.valid_seq_starts(state_len, stride=stride)
@@ -615,11 +750,23 @@ def train(
                 "val_loss_probe": float(np.mean(losses_probe)),
             }
 
-        def _save_ckpt(step_done: int, dest: Path) -> None:
+        def _save_ckpt(
+            step_done: int,
+            dest: Path,
+            use_best_continuation: bool = False,
+        ) -> None:
             """Atomic save (write to a temp file then rename) so a kill mid-write
-            never corrupts the last good checkpoint."""
+            never corrupts the last good checkpoint.
+
+            ``use_best_continuation``: swap in the lowest-val_loss_c
+            continuation-head snapshot instead of its current (possibly
+            overfit) weights, while everything else stays at ``step_done``'s
+            fully-converged state. See the best-val tracking comment above
+            ``history``/``val_history``.
+            """
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp = dest.with_suffix(dest.suffix + ".tmp")
+            cont_state = best_continuation_state if use_best_continuation else continuation_head.state_dict()
             torch.save(
                 {
                     # Re-save Stage-A weights so this checkpoint is self-contained.
@@ -628,10 +775,13 @@ def train(
                     "action_encoder": ckpt_in["action_encoder"],
                     "predictor": ckpt_in["predictor"],
                     "pred_proj": ckpt_in["pred_proj"],
-                    "reward_head": reward_head.state_dict(),
-                    "continuation_head": continuation_head.state_dict(),
-                    "value_head": value_head.state_dict(),
-                    "value_target_head": value_target_head.state_dict(),
+                    "reward_head": reward_heads[0].state_dict(),
+                    "reward_heads": [h.state_dict() for h in reward_heads],
+                    "continuation_head": cont_state,
+                    "value_head": value_heads[0].state_dict(),
+                    "value_heads": [h.state_dict() for h in value_heads],
+                    "value_target_head": value_target_heads[0].state_dict(),
+                    "value_target_heads": [h.state_dict() for h in value_target_heads],
                     "probe": probe.state_dict(),
                     "optim": optim.state_dict(),
                     "config": jepa["_arch"],
@@ -640,6 +790,8 @@ def train(
                     "num_steps": step_done,
                     "format_version": 2,
                     "pixel_normalization": "imagenet",
+                    "best_val_loss_c": best_val_loss_c,
+                    "best_continuation_head": {k: v.clone() for k, v in best_continuation_state.items()},
                     "numpy_rng_state": rng.bit_generator.state,
                     "torch_rng_state": torch.get_rng_state(),
                     "cuda_rng_state_all": (
@@ -696,11 +848,16 @@ def train(
                 vm = evaluate()
                 vm["step"] = step
                 val_history.append(vm)
+                if vm["val_loss_c"] < best_val_loss_c:
+                    best_val_loss_c = vm["val_loss_c"]
+                    best_continuation_state = {
+                        k: v.clone() for k, v in continuation_head.state_dict().items()
+                    }
                 print(
                     f"[train_lewm_heads] step={step:5d}  val  "
                     f"r={vm['val_loss_r']:.4f} c={vm['val_loss_c']:.4f} v={vm['val_loss_v']:.4f} "
                     f"r_im={vm['val_loss_r_im']:.4f} c_im={vm['val_loss_c_im']:.4f} "
-                    f"probe={vm['val_loss_probe']:.4f}"
+                    f"probe={vm['val_loss_probe']:.4f}  (best val c={best_val_loss_c:.4f})"
                 )
 
             completed_steps = step + 1
@@ -716,8 +873,11 @@ def train(
         rate = steps_run / elapsed if elapsed > 0 else 0.0
         print(f"[train_lewm_heads] done in {elapsed:.1f}s ({rate:.1f} step/s)")
 
-    _save_ckpt(max(start_step, num_steps), ckpt_out)
-    print(f"[train_lewm_heads] saved checkpoint -> {ckpt_out}")
+    _save_ckpt(max(start_step, num_steps), ckpt_out, use_best_continuation=True)
+    print(
+        f"[train_lewm_heads] saved checkpoint -> {ckpt_out} "
+        f"(continuation_head swapped to its best-val snapshot, val_loss_c={best_val_loss_c:.4f})"
+    )
 
     return {
         "ckpt_path": str(ckpt_out),

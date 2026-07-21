@@ -10,7 +10,12 @@ import torch
 from torch import nn
 
 from leworldgaming.agents.lewm.action_encoder import ActionEncoder
-from leworldgaming.agents.lewm.planner import _repeat_action_blocks, random_shooting
+from leworldgaming.agents.lewm.planner import (
+    _decode_pessimistic,
+    _repeat_action_blocks,
+    random_shooting,
+)
+from leworldgaming.agents.lewm.twohot import make_bins, twohot_decode
 from leworldgaming.data.replay_buffer import DataReader, _MultiStarts
 from leworldgaming.training._replay_utils import reduce_reward_seq, to_device_seq
 from leworldgaming.training.train_lewm_heads import _lambda_return
@@ -130,6 +135,48 @@ class LeWMContractTests(unittest.TestCase):
         )
         self.assertTrue(0 <= action < 56)
 
+    def test_decode_pessimistic_single_head_matches_plain_twohot_decode(self) -> None:
+        bins = make_bins(5, -1.0, 1.0, "cpu")
+        head = _ConstantLogitsHead(bins.numel(), peak_idx=2)
+        z = torch.zeros(3, 4)
+        out = _decode_pessimistic(head, bins, 0.5, z)
+        expected = twohot_decode(head(z), bins)
+        torch.testing.assert_close(out, expected)
+
+    def test_decode_pessimistic_ensemble_applies_mean_minus_penalty_times_std(self) -> None:
+        bins = make_bins(5, -1.0, 1.0, "cpu")
+        heads = nn.ModuleList(
+            [
+                _ConstantLogitsHead(bins.numel(), peak_idx=0),
+                _ConstantLogitsHead(bins.numel(), peak_idx=2),
+                _ConstantLogitsHead(bins.numel(), peak_idx=4),
+            ]
+        )
+        z = torch.zeros(3, 4)
+        penalty = 0.7
+        out = _decode_pessimistic(heads, bins, penalty, z)
+        per_member = torch.stack([twohot_decode(member(z), bins) for member in heads], dim=0)
+        expected = per_member.mean(dim=0) - penalty * per_member.std(dim=0)
+        torch.testing.assert_close(out, expected)
+        # Sanity: with real disagreement across members, penalizing must
+        # pull the score below the plain mean (this is the whole point —
+        # discourage the planner from trusting a lone optimistic member).
+        plain_mean = per_member.mean(dim=0)
+        self.assertTrue(torch.all(out < plain_mean))
+
+    def test_decode_pessimistic_ensemble_zero_penalty_is_plain_mean(self) -> None:
+        bins = make_bins(5, -1.0, 1.0, "cpu")
+        heads = nn.ModuleList(
+            [
+                _ConstantLogitsHead(bins.numel(), peak_idx=0),
+                _ConstantLogitsHead(bins.numel(), peak_idx=4),
+            ]
+        )
+        z = torch.zeros(2, 4)
+        out = _decode_pessimistic(heads, bins, 0.0, z)
+        per_member = torch.stack([twohot_decode(member(z), bins) for member in heads], dim=0)
+        torch.testing.assert_close(out, per_member.mean(dim=0))
+
     def test_imagenet_normalization_matches_reference_constants(self) -> None:
         pixels = torch.zeros(2, 3, 4, 4, dtype=torch.uint8)
         normalized = normalize_imagenet_pixels(pixels)
@@ -148,6 +195,20 @@ class _IdentityPredictor(nn.Module):
 class _FirstCoordinateProbe(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x[:, :1]
+
+
+class _ConstantLogitsHead(nn.Module):
+    """Stub reward/value head: ignores its input, always emits a sharply
+    peaked twohot logits vector at ``peak_idx`` (broadcasting over batch)."""
+
+    def __init__(self, num_bins: int, peak_idx: int) -> None:
+        super().__init__()
+        logits = torch.full((num_bins,), -10.0)
+        logits[peak_idx] = 10.0
+        self.logits = logits
+
+    def forward(self, z: torch.Tensor, *args: torch.Tensor) -> torch.Tensor:
+        return self.logits.unsqueeze(0).expand(z.shape[0], -1)
 
 
 if __name__ == "__main__":

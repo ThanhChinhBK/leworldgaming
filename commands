@@ -29,3 +29,18 @@
  
  # 10. defensive vs MctsAiZoning
  uv run python scripts/collect_data.py --games 20 --policy-p1 defensive --policy-p2 MctsAiZoning --seed 10 --pixels --out "$DATA_DIR/10_defensive_v_mctszoning.h5"
+
+  uv run python scripts/collect_data.py --games 20 --policy-p1 aggressive --policy-p2 MctsAiZoning --seed 32 --pixels --out "$DATA_DIR/32_mctszoning_v_mctszoning.h5"
+
+
+uv run python scripts/collect_data.py --games 20 --policy-p1 aggressive --policy-p2 aggressive --seed 36 --pixels --out "$DATA_DIR/36_aggressive_v_aggressive.h5"
+
+uv run python scripts/collect_data.py --games 20 --policy-p1 aggressive --policy-p2 MctsAi23i --seed 67 --pixels --out "$DATA_DIR/67_aggressive_v_mcts23i.h5"
+
+uv run python scripts/collect_data.py --games 20 --policy-p1 MctsAi23i --policy-p2 aggressive --seed 100 --pixels --out "$DATA_DIR/68_mcts23i_v_aggressive.h5"
+
+uv run python scripts/collect_data.py --games 20 --policy-p1 MctsAi23i --policy-p2 defensive --seed 121 --pixels --out "$DATA_DIR/69_mcts23i_v_defensive.h5"
+
+
+
+ uv run python scripts/collect_data.py --games 20 --policy-p1 MctsAiZoning --policy-p2 defensive --seed 159 --pixels --out "$DATA_DIR/150_defensive_v_mctszoning.h5"

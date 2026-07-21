@@ -24,7 +24,8 @@ def main() -> None:
         "--stage",
         choices=["a", "b"],
         default="a",
-        help="LeWM only: 'a' = JEPA pretraining (default), 'b' = head training on top of a Stage-A ckpt.",
+        help="LeWM only: 'a' = JEPA pretraining (default), 'b' = head training on top of a "
+             "Stage-A ckpt.",
     )
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--config", type=str, default=None)

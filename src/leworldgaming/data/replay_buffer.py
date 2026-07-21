@@ -70,6 +70,14 @@ _PER_CHAR_SCHEMA: dict[str, str] = {
     "atk_active": "int16",
     "atk_hit_damage": "int16",
     "atk_type": "int8",
+    # Character's own last-executed Action, as pyftg's Action.to_int() ID
+    # (0-55ish, includes NEUTRAL). Added so a small OppActionHead can be
+    # trained (see docs/lewm_stride5_reretrain_vs_chunking_2026-07-20.md
+    # "Planner-alternatives research") to behavior-clone P(a_opp | z) for
+    # adversarial CEM scoring -- distinct from the top-level "action" field,
+    # which only records our own agent's *chosen* action, not what the JVM
+    # observed either character actually executing that frame.
+    "action": "int32",
 }
 _GLOBAL_SCHEMA: dict[str, str] = {
     "current_round": "int8",

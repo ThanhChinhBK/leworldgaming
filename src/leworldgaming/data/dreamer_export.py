@@ -40,8 +40,8 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-from leworldgaming.data.views import _build_dreamer_vector
 from leworldgaming.data.replay_buffer import GROUPS as _BUFFER_GROUPS
+from leworldgaming.data.views import _build_dreamer_vector
 from leworldgaming.env.action_space import NUM_ACTIONS
 from leworldgaming.env.state_vector import (
     DREAMER_STATE_DIM,
@@ -89,7 +89,7 @@ def _episode_slices(episode_starts: np.ndarray, n_total: int) -> list[tuple[int,
     if not starts:
         return [(0, n_total)] if n_total > 0 else []
     stops = starts[1:] + [n_total]
-    return list(zip(starts, stops))
+    return list(zip(starts, stops, strict=True))
 
 
 def _read_episode_arrays(f: h5py.File, a: int, b: int) -> dict[str, np.ndarray]:
@@ -113,6 +113,57 @@ def _resolve_h5_paths(data_path: str | Path) -> list[Path]:
     return [data_path]
 
 
+def _stride_block_starts(length: int, stride: int) -> np.ndarray:
+    """Raw-frame indices where each ``stride``-sized decision block begins.
+
+    Mirrors ``leworldgaming.training._replay_utils`` conventions for LeWM's
+    own ``temporal_stride`` handling: block ``i`` "observes" raw frame
+    ``i*stride`` (this is the frame whose action was actually chosen/held at
+    that decision point) and "owns" the future reward span
+    ``[i*stride+1, i*stride+1+stride)`` — i.e. rewards are shifted by one
+    relative to actions, matching ``reduce_reward_seq``'s ``[t+1, t+stride+1)``
+    alignment (see repo memory "reward timing": reward[t] is the HP-delta
+    entering obs[t], not the reward earned by action[t]).
+
+    Only block starts with at least one raw future reward row are kept
+    (``s <= length - 2``), so every block has a non-empty reward window.
+    """
+    if length < 2:
+        return np.empty(0, dtype=np.int64)
+    return np.arange(0, length - 1, stride, dtype=np.int64)
+
+
+def _stride_reduce_reward(
+    reward_arr: np.ndarray, starts: np.ndarray, stride: int, length: int
+) -> np.ndarray:
+    """Sum raw per-frame reward over each block's shifted window.
+
+    Block ``i`` (starting at raw frame ``starts[i]``) sums
+    ``reward_arr[starts[i]+1 : min(starts[i]+1+stride, length)]`` — the last
+    block's window is clipped (not truncated-and-dropped) to ``length`` so
+    any leftover tail frames (when ``length-1`` isn't an exact multiple of
+    ``stride``) still contribute to the final block instead of being
+    silently discarded, conserving total episode reward exactly.
+    """
+    out = np.empty(len(starts), dtype=np.float32)
+    for i, s in enumerate(starts):
+        end = min(int(s) + 1 + stride, length)
+        out[i] = reward_arr[int(s) + 1 : end].sum()
+    return out
+
+
+def _stride_terminal_flags(
+    done_arr: np.ndarray, starts: np.ndarray, stride: int, length: int
+) -> np.ndarray:
+    """``is_terminal`` per block: True iff the raw frame at the end of that
+    block's reward window is the episode's true terminal frame."""
+    out = np.zeros(len(starts), dtype=bool)
+    for i, s in enumerate(starts):
+        end = min(int(s) + 1 + stride, length)
+        out[i] = bool(done_arr[end - 1])
+    return out
+
+
 def export_episodes_to_npz(
     data_path: str | Path,
     out_dir: str | Path,
@@ -120,6 +171,7 @@ def export_episodes_to_npz(
     overwrite: bool = False,
     obs_mode: str = "vector",
     image_size: int = _DEFAULT_IMAGE_SIZE,
+    stride: int = 1,
 ) -> int:
     """Slice HDF5 replay file(s) into per-episode npz files. Returns number written.
 
@@ -129,13 +181,26 @@ def export_episodes_to_npz(
     or ``"image"`` (full pixels down-sampled to ``image_size``²). Each mode
     has its own schema marker so caches never mix.
 
-    Cache invalidation: writes a small ``_EXPORT_SCHEMA`` marker. If the
-    marker is missing or stale and ``out_dir`` already has npz files,
+    ``stride`` (temporal frameskip, a.k.a. action repeat): when ``>1``, only
+    every ``stride``-th raw frame is kept as an observation/decision point
+    (matching LeWM's ``temporal_stride`` convention — see
+    ``configs/lewm.yaml`` and ``_stride_block_starts`` above), so a Dreamer
+    trained this way can be compared to LeWM at the same decision rate.
+    ``stride=1`` (default) is the original unstrided/backward-compatible
+    behavior — byte-identical to before this parameter was added. Reward is
+    summed (not just kept at the block-start frame) over each block's
+    shifted window via ``_stride_reduce_reward`` so total episode reward is
+    conserved regardless of stride.
+
+    Cache invalidation: writes a small ``_EXPORT_SCHEMA`` marker (stride is
+    folded into the marker string so caches at different strides never mix).
+    If the marker is missing or stale and ``out_dir`` already has npz files,
     re-export. Otherwise skip silently.
     """
     if obs_mode not in _EXPORT_SCHEMA:
         raise ValueError(f"obs_mode must be one of {sorted(_EXPORT_SCHEMA)}, got {obs_mode!r}")
-    schema = _EXPORT_SCHEMA[obs_mode]
+    stride = int(stride) or 1
+    schema = f"{_EXPORT_SCHEMA[obs_mode]}_stride{stride}"
 
     h5_paths = _resolve_h5_paths(data_path)
     out_dir = Path(out_dir)
@@ -166,7 +231,7 @@ def export_episodes_to_npz(
             episode_starts = f["episode_starts"][:]
             slices = _episode_slices(episode_starts, n)
             print(f"[dreamer_export] {h5_path}: {n} steps, {len(slices)} episodes "
-                  f"(obs_mode={obs_mode}"
+                  f"(obs_mode={obs_mode}, stride={stride}"
                   f"{f', img={image_size}' if obs_mode == 'image' else f', state_dim={DREAMER_STATE_DIM}'})")
 
             if obs_mode == "image" and "pixels" not in f:
@@ -185,35 +250,53 @@ def export_episodes_to_npz(
                 if length < 2:
                     continue
 
-                actions_int = action_arr[a:b].astype(np.int64)
-                action_oh = np.zeros((length, action_dim), dtype=np.float32)
-                action_oh[np.arange(length), actions_int] = 1.0
+                if stride == 1:
+                    actions_int = action_arr[a:b].astype(np.int64)
+                    out_len = length
+                    is_first = is_first_arr[a:b].copy()
+                    is_first[0] = True
+                    is_terminal = done_arr[a:b].copy()
+                    is_terminal[-1] = True
+                    reward_out = reward_arr[a:b].astype(np.float32)
+                    pick_idx = np.arange(length)
+                else:
+                    starts = _stride_block_starts(length, stride)
+                    if len(starts) == 0:
+                        continue
+                    out_len = len(starts)
+                    pick_idx = starts
+                    actions_int = action_arr[a:b][starts].astype(np.int64)
+                    is_first = np.zeros(out_len, dtype=bool)
+                    is_first[0] = True
+                    is_terminal = _stride_terminal_flags(
+                        done_arr[a:b], starts, stride, length
+                    )
+                    reward_out = _stride_reduce_reward(
+                        reward_arr[a:b], starts, stride, length
+                    )
 
-                is_first = is_first_arr[a:b].copy()
-                is_first[0] = True
-
-                is_terminal = done_arr[a:b].copy()
-                is_terminal[-1] = True
+                action_oh = np.zeros((out_len, action_dim), dtype=np.float32)
+                action_oh[np.arange(out_len), actions_int] = 1.0
 
                 ep = {
                     "action": action_oh,
-                    "reward": reward_arr[a:b].astype(np.float32),
+                    "reward": reward_out,
                     "is_first": is_first,
                     "is_terminal": is_terminal,
                 }
 
                 if obs_mode == "image":
-                    px = f["pixels"][a:b]  # (length, C, H, W) uint8
+                    px = f["pixels"][a:b][pick_idx]  # (out_len, C, H, W) uint8
                     ep["image"] = _downsample_pixels(px, image_size)
                 else:
                     ep_primitives = _read_episode_arrays(f, a, b)
-                    ep_primitives = {k: v[None, :] for k, v in ep_primitives.items()}
+                    ep_primitives = {k: v[pick_idx][None, :] for k, v in ep_primitives.items()}
                     ep_primitives = canonicalize_sample(ep_primitives)
                     vector = _build_dreamer_vector(ep_primitives)[0]
                     ep["vector"] = vector.astype(np.float32)
-                    ep["image"] = np.zeros((length, 1, 1, 3), dtype=np.uint8)
+                    ep["image"] = np.zeros((out_len, 1, 1, 3), dtype=np.uint8)
 
-                filename = out_dir / f"ep{global_ep_idx:06d}-{length}.npz"
+                filename = out_dir / f"ep{global_ep_idx:06d}-{out_len}.npz"
                 np.savez_compressed(filename, **ep)
                 n_written += 1
                 global_ep_idx += 1

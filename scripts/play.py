@@ -15,6 +15,14 @@ Then:
     # Once checkpoints exist (train on the other machine, copy into data/):
     uv run python scripts/play.py --agent pets --ckpt data/pets_checkpoint.pt
     uv run python scripts/play.py --agent lewm --ckpt data/lewm_heads_checkpoint.pt
+    uv run python scripts/play.py --agent dreamer --ckpt data/dreamer_checkpoint.pt
+
+    # LeWM planner selection (--planner random | cem; ignored for other agents):
+    #   random -- one-shot random shooting, the planner from the original
+    #             JEPA-planning paper (no elite refinement, no warm-start).
+    #   cem    -- iCEM-style iterative refinement + warm-start (default).
+    uv run python scripts/play.py --agent lewm --ckpt data/lewm_heads_checkpoint.pt \\
+        --planner random
 
 Two evaluation modes (``--pace``):
 
@@ -55,7 +63,7 @@ class RandomAgent:
         return self._rng.randrange(self._n)
 
 
-def build_agent(name: str, ckpt: str | None, device: str):
+def build_agent(name: str, ckpt: str | None, device: str, planner: str | None = None, **planner_kwargs):
     name = name.lower()
     if name == "random":
         return RandomAgent()
@@ -72,13 +80,16 @@ def build_agent(name: str, ckpt: str | None, device: str):
         agent = LewmAgent(device=device)
         if ckpt:
             agent.load(ckpt)
+        if planner is not None or any(v is not None for v in planner_kwargs.values()):
+            agent.configure_planner(name=planner, **planner_kwargs)
         agent.warmup()
         return agent
     if name == "dreamer":
-        raise SystemExit(
-            "Dreamer online play needs DreamerAgent.act() (still a stub). "
-            "Use --agent pets/lewm/random for now."
-        )
+        from leworldgaming.training.train_dreamer import build_agent_for_inference
+
+        if not ckpt:
+            raise SystemExit("--agent dreamer requires --ckpt (a saved dreamer checkpoint).")
+        return build_agent_for_inference(ckpt, device=device)
     raise SystemExit(f"Unknown agent: {name!r}. Choose: random, pets, lewm, dreamer.")
 
 
@@ -105,6 +116,49 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=31415)
     p.add_argument("--device", default="cpu", help="cpu | mps | cuda")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--planner", default=None, choices=[None, "random", "cem"],
+                   help="LeWM only. 'random': one-shot random shooting (the original "
+                        "JEPA-planning paper's baseline). 'cem': iCEM-style iterative "
+                        "elite refinement + warm-start (default set by the checkpoint's "
+                        "own config, normally 'cem'). Ignored for pets/dreamer/random.")
+    p.add_argument("--planner-horizon", type=int, default=None,
+                   help="Rollout length in decision-blocks (default 8). Bigger = more "
+                        "lookahead but linearly more predictor calls/decision latency.")
+    p.add_argument("--planner-samples", type=int, default=None,
+                   help="Candidate action sequences per iteration (default 24). Bigger "
+                        "= better search but linearly more latency. Measured on an RTX "
+                        "5060 Ti: samples=64/iters=3/horizon=5 ~70ms/decision vs "
+                        "samples=24/iters=1/horizon=8 ~38ms/decision, against an ~83ms "
+                        "real-time budget at temporal_stride=5 (60fps).")
+    p.add_argument("--planner-iters", type=int, default=None,
+                   help="CEM only: number of elite-refinement iterations (default 1). "
+                        "Each iteration re-scores `samples` sequences, so cost scales "
+                        "~linearly with iters too.")
+    p.add_argument("--planner-sticky-prob", type=float, default=None,
+                   help="CEM only: prob. a rollout step repeats the previous step's action")
+    p.add_argument("--planner-momentum", type=float, default=None,
+                   help="CEM only: how much of the previous decision's warm-started "
+                        "distribution carries over vs. the freshly-refit one (default "
+                        "0.3 at stride=5, 0.1 at stride=2). Higher = slower to correct "
+                        "a locked-in action; see planner.cem_shooting docstring point 3.")
+    p.add_argument("--planner-min-prob", type=float, default=None,
+                   help="CEM only: uniform exploration floor mixed into the refit "
+                        "per-timestep distribution each iteration (default 0.02 at "
+                        "stride=5, 0.05 at stride=2). Higher = faster escape from a "
+                        "bad action lock-in at the cost of noisier action choice.")
+    p.add_argument("--planner-use-cont-head", action="store_true", default=None,
+                   help="CEM/random: re-enable the (known miscalibrated) continuation head "
+                        "for rollout discounting instead of a constant gamma")
+    p.add_argument("--planner-no-value-head", action="store_true", default=None,
+                   help="CEM/random: disable the value-head bootstrap term (use only the "
+                        "finite-horizon reward sum), e.g. if the value head appears to be "
+                        "overfitting/miscalibrated on held-out data.")
+    p.add_argument("--planner-allow-state-actions", action="store_true", default=None,
+                   help="CEM/random: DON'T restrict sampling to the ~40 commandable "
+                        "actions; also let the planner sample the ~16 unplayable "
+                        "'state observation' Action values (STAND/AIR/*_RECOV/etc.) "
+                        "that CommandCenter can't execute and the action-encoder never "
+                        "saw as a training label. Off (restricted) by default.")
     return p.parse_args()
 
 
@@ -117,7 +171,27 @@ def main() -> None:
     if obs_mode == "auto":
         obs_mode = "pixel" if args.agent.lower() == "lewm" else "state"
 
-    agent = build_agent(args.agent, args.ckpt, args.device)
+    restrict_to_playable_actions = (
+        None if args.planner_allow_state_actions is None
+        else not args.planner_allow_state_actions
+    )
+    use_value_head = (
+        None if args.planner_no_value_head is None
+        else not args.planner_no_value_head
+    )
+    agent = build_agent(
+        args.agent, args.ckpt, args.device,
+        planner=args.planner,
+        horizon=args.planner_horizon,
+        num_samples=args.planner_samples,
+        num_iters=args.planner_iters,
+        sticky_prob=args.planner_sticky_prob,
+        momentum=args.planner_momentum,
+        min_prob=args.planner_min_prob,
+        use_continuation_head=args.planner_use_cont_head,
+        use_value_head=use_value_head,
+        restrict_to_playable_actions=restrict_to_playable_actions,
+    )
     if args.agent.lower() == "lewm":
         expected_stride = int(agent.temporal_stride)
         if args.frame_skip is None:
