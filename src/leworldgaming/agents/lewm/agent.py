@@ -19,7 +19,13 @@ from leworldgaming.agents.lewm.action_encoder import ActionEncoder
 from leworldgaming.agents.lewm.continuation_head import ContinuationHead
 from leworldgaming.agents.lewm.encoder import Encoder
 from leworldgaming.agents.lewm.mcts_planner import mcts_search
+from leworldgaming.agents.lewm.online_opponent_model import (
+    OnlineOpponentModel,
+    bias_action_dist_from_opp_prediction,
+)
+from leworldgaming.agents.lewm.opp_action_head import OppActionHead
 from leworldgaming.agents.lewm.planner import cem_shooting, random_shooting
+from leworldgaming.agents.lewm.policy_head import PolicyHead
 from leworldgaming.agents.lewm.predictor import Predictor
 from leworldgaming.agents.lewm.probe import LinearProbe
 from leworldgaming.agents.lewm.projector import Projector
@@ -69,6 +75,25 @@ def _commandable_action_ids(num_actions: int) -> torch.Tensor | None:
         i for i in range(num_actions)
         if Action.from_int(i).name == "NEUTRAL" or Action.from_int(i).name in playable_names
     ]
+    return torch.tensor(ids, dtype=torch.long)
+
+
+def _resolve_idle_action_ids(names: list[str]) -> torch.Tensor | None:
+    """Map action-name strings (e.g. ``["NEUTRAL"]``) to FightingICE
+    ``Action`` enum ids for the CEM idle-penalty term (see
+    ``planner._score_action_sequences``). Returns ``None`` if ``pyftg`` is
+    unavailable or no names resolve (idle penalty becomes a no-op).
+    """
+    if not names:
+        return None
+    try:
+        from pyftg.models.enums.action import Action
+    except Exception:  # pragma: no cover - pyftg optional in some test envs
+        return None
+    name_set = {str(n).upper() for n in names}
+    ids = [i for i in range(56) if Action.from_int(i).name in name_set]
+    if not ids:
+        return None
     return torch.tensor(ids, dtype=torch.long)
 
 
@@ -188,12 +213,43 @@ class LewmAgent(AgentBase):
             float(self.heads_cfg.get("value_high", 10.0)),
             self.device,
         )
+        # Policy-prior head (BC warm-start for CEM, see policy_head.py): only
+        # constructed if the checkpoint's heads_config enables it (or one is
+        # present in a loaded checkpoint -- see ``load()``). None (default)
+        # preserves the original uniform-init CEM behavior exactly.
+        self.policy_head: nn.Module | None = None
+        if float(self.heads_cfg.get("policy_loss_weight", 0.0)) > 0.0:
+            self.policy_head = PolicyHead(
+                latent_dim=latent_dim,
+                hidden_dim=int(self.heads_cfg.get("policy_hidden_dim", 256)),
+                num_actions=self.action_dim,
+            ).to(self.device)
         # Policy-guided CEM was tried (2026-07-21) and abandoned: the
         # distilled Q-value target across all ~56 actions turned out to be
         # essentially uniform (std ~0.0008, entropy ~= log(num_valid) even
         # at temperature=0.01), i.e. the reward/value heads don't yet
         # discriminate actions well enough on a single step to distill a
         # useful prior. No policy-prior head/config remains.
+
+        # Opponent-action head (real-data BC, see opp_action_head.py /
+        # scripts/train_opp_action_head.py / docs/lewm_opp_action_head_2026-07-23.md):
+        # predicts the opponent's next action from our own encoded z, trained
+        # on genuinely recorded Dreamer-opponent data (fresh 2026-07-23
+        # collection), unlike ``OnlineOpponentModel``'s hand-picked geometric
+        # proxy features. Loaded separately via ``load_opp_action_head()``
+        # (kept out of the main checkpoint -- "must keep the LeWM checkpoint"
+        # constraint) and OFF by default; opt in via configure_planner
+        # (use_opp_action_model=True) after calling load_opp_action_head().
+        self.opp_action_head: nn.Module | None = None
+        self.use_opp_action_model: bool = bool(
+            cfg.get("planner", {}).get("use_opp_action_model", False)
+            if isinstance(cfg.get("planner"), dict) else False
+        )
+        self.opp_action_model_strength: float = float(
+            cfg.get("planner", {}).get("opp_action_model_strength", 1.5)
+            if isinstance(cfg.get("planner"), dict) else 1.5
+        )
+
         self._z_history: list[torch.Tensor] = []
         self._action_history: list[int] = []
 
@@ -314,6 +370,59 @@ class LewmAgent(AgentBase):
         self.planner_plan_raw_actions = bool(
             planner_cfg.get("plan_raw_actions", False)
         )
+        # (#1) Soft/Boltzmann (MPPI-style) elite update temperature and
+        # (#2) value-head down-weighting + per-step reward winsorization.
+        # All planner-only, no-retrain knobs (see planner.cem_shooting /
+        # _score_action_sequences). Defaults reproduce the old behavior:
+        # elite_temp=0 -> hard top-k count, value_weight=1, reward_clip=0.
+        # (#1 MPPI soft/Boltzmann elite update, planner.cem_shooting). Live
+        # A/B on the docker-harness (2026-07-23, n=36 rounds each, paired
+        # runs vs Dreamer, --p2-frame-skip 2, ZEN): elite_temp=1.0 scored
+        # 14/36=38.9% vs elite_temp=0.0 (hard top-k, old default)'s
+        # 7/36=19.4% -- roughly 2x win rate, holding up consistently across
+        # 4 independent paired runs of 9 rounds each (individual-run range
+        # 11.1%-55.6% for elite_temp=1.0 vs 11.1%-33.3% for 0.0, i.e. the
+        # *floor* moved up, not just the average). Promoted to the new
+        # default; 0.0 still available via configure_planner for exact
+        # legacy reproduction.
+        self.planner_elite_temp = float(planner_cfg.get("elite_temp", 1.0))
+        self.planner_value_weight = float(planner_cfg.get("value_weight", 1.0))
+        self.planner_reward_clip = float(planner_cfg.get("reward_clip", 0.0))
+        # (#3) Idle/no-op penalty: explicit, deterministic anti-idle bias in
+        # the CEM score (see planner._score_action_sequences). Defaults to
+        # penalizing NEUTRAL only (id 0) -- observed live as the agent
+        # standing still doing nothing for long stretches, a known CEM
+        # failure mode when the reward/value heads are too flat/noisy to
+        # otherwise distinguish "stand still" from "attack". 0.0 (default)
+        # disables it, reproducing old behavior exactly.
+        self.planner_idle_penalty = float(planner_cfg.get("idle_penalty", 0.0))
+        _idle_names = planner_cfg.get("idle_action_names", ["NEUTRAL"])
+        self.planner_idle_action_ids = _resolve_idle_action_ids(_idle_names)
+        # Anti-repeat penalty (planner.cem_shooting/_score_action_sequences'
+        # ``repeat_penalty``): subtract a fixed cost for any planned raw
+        # frame whose action repeats the immediately-preceding one (first
+        # planned frame is compared against the actually-executed previous
+        # decision, ``self._last_executed_action``, closing the loophole at
+        # decision boundaries). Counterweights ``sticky_prob``'s tendency to
+        # lock onto one action for long stretches once idle_penalty alone
+        # isn't enough (idle_penalty only targets a fixed no-op set, not
+        # arbitrary repeated non-idle actions like holding one guard/dash).
+        # 0.0 (default) disables it, reproducing old behavior exactly.
+        self.planner_repeat_penalty = float(planner_cfg.get("repeat_penalty", 0.0))
+        self._last_executed_action: int | None = None
+        # Policy-prior CEM warm start (see policy_head.py). Only has any
+        # effect if the loaded checkpoint's heads_config enabled
+        # policy_loss_weight > 0 (i.e. self.policy_head is not None --
+        # constructed in _build_modules above). Default False: live A/B
+        # (2026-07-22/23, docker-harness, n=9+9 rounds) showed the BC-warm-
+        # start prior making win rate WORSE (11.1%/22.2%) vs the v3
+        # baseline (33.3%) at policy_loss_weight=1.0's convergence level
+        # (train CE ~3.3-3.4, barely below ln(56)=4.03 -- the mixed-policy
+        # dataset's behavior is too multi-modal for straightforward BC to
+        # learn a useful prior). Kept as opt-in infrastructure (set True via
+        # configure_planner) rather than removed, since a better-trained or
+        # differently-regularized policy_head could still pay off later.
+        self.use_policy_prior = bool(planner_cfg.get("use_policy_prior", False))
         self.restrict_to_playable_actions = bool(
             planner_cfg.get("restrict_to_playable_actions", True)
         )
@@ -328,6 +437,28 @@ class LewmAgent(AgentBase):
         # since the last actual cem_shooting call (fed to its warm_shift).
         self._chunk_queue: list[int] = []
         self._chunk_consumed: int = 0
+
+        # Online opponent model (RHEAPI-style, see
+        # agents/lewm/online_opponent_model.py and
+        # docs/lewm_planner_literature_research_2026-07-22.md). OFF by default
+        # -- opt in via cfg["planner"]["opponent_model"]=True or
+        # configure_planner(use_opponent_model=True). Learns a live,
+        # well-calibrated threat estimate from observed HP deltas and biases
+        # the planner's first-action distribution toward guard/evasion when a
+        # hit is imminent and toward offense when it's safe. Needs the full
+        # obs dict (obs["own"]/obs["opp"]), which both play.py and self_play
+        # provide alongside obs["pixels"]; degrades to a no-op if absent.
+        om_cfg = dict(planner_cfg.get("opponent_model", {})) if isinstance(
+            planner_cfg.get("opponent_model"), dict
+        ) else {}
+        self.use_opponent_model = bool(
+            planner_cfg.get("opponent_model") is True or om_cfg.get("enabled", False)
+        )
+        self.opponent_model = OnlineOpponentModel(
+            strength=float(om_cfg.get("strength", 1.5)),
+            lr=float(om_cfg.get("lr", 0.02)),
+            threshold=float(om_cfg.get("threshold", 0.5)),
+        )
 
         self._set_eval()
 
@@ -387,6 +518,24 @@ class LewmAgent(AgentBase):
         # ``horizon``/``num_samples`` are cem_shooting/random_shooting-only
         # kwargs (mcts_search uses num_simulations/max_depth instead) --
         # kept out of the shared dict above and added per-branch below.
+        #
+        # Online opponent model (RHEAPI-style): close the supervised loop on
+        # the *previous* decision's threat prediction using this frame's
+        # observed HP, then predict the threat for the current frame. Both are
+        # no-ops if obs lacks the own/opp primitive dicts.
+        threat_p: float | None = None
+        if self.use_opponent_model and "opp" in obs and "own" in obs:
+            self.opponent_model.observe_outcome(obs)
+            threat_p = self.opponent_model.predict_threat(obs)
+
+        # Policy-prior CEM warm start (see policy_head.py / cem_shooting's
+        # ``policy_prior`` docstring): only computed when a policy_head was
+        # trained AND the caller opted in via configure_planner -- None
+        # (default) preserves the original uniform-init behavior exactly.
+        policy_prior: torch.Tensor | None = None
+        if self.use_policy_prior and self.policy_head is not None:
+            policy_prior = torch.softmax(self.policy_head(z), dim=-1)
+
         if self.planner_name == "cem":
             if self._chunk_queue:
                 # Mid-chunk: reuse an action already sampled from the last
@@ -410,9 +559,53 @@ class LewmAgent(AgentBase):
                     init_dist=self._plan_dist,
                     warm_shift=max(self._chunk_consumed, 1),
                     plan_raw_actions=self.planner_plan_raw_actions,
+                    elite_temp=self.planner_elite_temp,
+                    value_weight=self.planner_value_weight,
+                    reward_clip=self.planner_reward_clip,
+                    idle_action_ids=self.planner_idle_action_ids,
+                    idle_penalty=self.planner_idle_penalty,
+                    policy_prior=policy_prior,
+                    repeat_penalty=self.planner_repeat_penalty,
+                    prev_action=self._last_executed_action,
                     **common_kwargs,
                 )
                 self._chunk_consumed = 0
+                # Opponent-model bias: re-sample the executed action from the
+                # planner's dist[0] after up-weighting guard/evasion (or
+                # offense) per the online threat estimate. Only on a fresh
+                # replan -- the CEM search itself is unchanged; this is a thin
+                # first-action overlay (see online_opponent_model.py).
+                if threat_p is not None and self._plan_dist is not None:
+                    biased = self.opponent_model.bias_action_dist(
+                        self._plan_dist[0].detach().cpu().numpy(),
+                        threat_p,
+                        None,
+                    )
+                    action = int(
+                        torch.multinomial(
+                            torch.as_tensor(biased, dtype=torch.float32), 1
+                        ).item()
+                    )
+                if (
+                    self.use_opp_action_model
+                    and self.opp_action_head is not None
+                    and self._plan_dist is not None
+                ):
+                    opp_action_probs = torch.softmax(
+                        self.opp_action_head(z), dim=-1
+                    ).detach().cpu().numpy()
+                    biased = bias_action_dist_from_opp_prediction(
+                        self._plan_dist[0].detach().cpu().numpy()
+                        if threat_p is None
+                        else biased,
+                        opp_action_probs,
+                        strength=self.opp_action_model_strength,
+                    )
+                    action = int(
+                        torch.multinomial(
+                            torch.as_tensor(biased, dtype=torch.float32), 1
+                        ).item()
+                    )
                 if self.planner_chunk_size > 1:
                     extra = min(self.planner_chunk_size - 1, self._plan_dist.shape[0] - 1)
                     self._chunk_queue = [
@@ -446,6 +639,7 @@ class LewmAgent(AgentBase):
             )
         self._z_history.append(z.detach())
         self._action_history.append(action)
+        self._last_executed_action = int(action)
         keep = max(self.history_size - 1, 0)
         if keep:
             self._z_history = self._z_history[-keep:]
@@ -461,6 +655,10 @@ class LewmAgent(AgentBase):
         self._plan_dist = None
         self._chunk_queue = []
         self._chunk_consumed = 0
+        self._last_executed_action = None
+        # Reset only the OM's per-episode transient state; its learned
+        # weights persist across rounds (RHEAPI's adapt-over-a-match property).
+        self.opponent_model.reset()
 
     def configure_planner(
         self,
@@ -476,8 +674,19 @@ class LewmAgent(AgentBase):
         use_value_head: bool | None = None,
         restrict_to_playable_actions: bool | None = None,
         uncertainty_penalty: float | None = None,
+        use_opponent_model: bool | None = None,
+        opponent_model_strength: float | None = None,
         chunk_size: int | None = None,
         plan_raw_actions: bool | None = None,
+        elite_temp: float | None = None,
+        value_weight: float | None = None,
+        reward_clip: float | None = None,
+        idle_penalty: float | None = None,
+        idle_action_names: list[str] | None = None,
+        repeat_penalty: float | None = None,
+        use_policy_prior: bool | None = None,
+        use_opp_action_model: bool | None = None,
+        opp_action_model_strength: float | None = None,
         num_simulations: int | None = None,
         max_depth: int | None = None,
         c_puct: float | None = None,
@@ -521,10 +730,32 @@ class LewmAgent(AgentBase):
             self.use_value_head = bool(use_value_head)
         if uncertainty_penalty is not None:
             self.planner_uncertainty_penalty = float(uncertainty_penalty)
+        if use_opponent_model is not None:
+            self.use_opponent_model = bool(use_opponent_model)
+        if opponent_model_strength is not None:
+            self.opponent_model.strength = float(opponent_model_strength)
         if chunk_size is not None:
             self.planner_chunk_size = max(1, int(chunk_size))
         if plan_raw_actions is not None:
             self.planner_plan_raw_actions = bool(plan_raw_actions)
+        if elite_temp is not None:
+            self.planner_elite_temp = float(elite_temp)
+        if value_weight is not None:
+            self.planner_value_weight = float(value_weight)
+        if reward_clip is not None:
+            self.planner_reward_clip = float(reward_clip)
+        if idle_penalty is not None:
+            self.planner_idle_penalty = float(idle_penalty)
+        if idle_action_names is not None:
+            self.planner_idle_action_ids = _resolve_idle_action_ids(idle_action_names)
+        if repeat_penalty is not None:
+            self.planner_repeat_penalty = float(repeat_penalty)
+        if use_policy_prior is not None:
+            self.use_policy_prior = bool(use_policy_prior)
+        if use_opp_action_model is not None:
+            self.use_opp_action_model = bool(use_opp_action_model)
+        if opp_action_model_strength is not None:
+            self.opp_action_model_strength = float(opp_action_model_strength)
         if num_simulations is not None:
             self.planner_num_simulations = int(num_simulations)
         if max_depth is not None:
@@ -623,6 +854,23 @@ class LewmAgent(AgentBase):
         else:
             head.load_state_dict(ckpt[singular_key])
 
+    def load_opp_action_head(self, path: str) -> None:
+        """Load a separately-trained ``OppActionHead`` checkpoint (see
+        ``scripts/train_opp_action_head.py``). Does not touch the main LeWM
+        checkpoint/state -- purely additive, off by default until
+        ``configure_planner(use_opp_action_model=True)`` is also called.
+        """
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        self.opp_action_head = OppActionHead(
+            latent_dim=int(ckpt.get("latent_dim", self.latent_dim)),
+            hidden_dim=int(ckpt.get("hidden_dim", 256)),
+            num_actions=int(ckpt.get("num_actions", self.action_dim)),
+        ).to(self.device)
+        self.opp_action_head.load_state_dict(ckpt["opp_action_head"])
+        self.opp_action_head.eval()
+        for p in self.opp_action_head.parameters():
+            p.requires_grad_(False)
+
     def load(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         cfg = ckpt.get("config")
@@ -651,6 +899,8 @@ class LewmAgent(AgentBase):
             self.continuation_head.load_state_dict(ckpt["continuation_head"])
             self._load_head(self.value_head, ckpt, "value_heads", "value_head")
             self.heads_loaded = True
+            if self.policy_head is not None and ckpt.get("policy_head") is not None:
+                self.policy_head.load_state_dict(ckpt["policy_head"])
         else:
             warnings.warn(
                 "LewmAgent.load: Stage-B heads (reward/continuation/value) not found in "

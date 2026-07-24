@@ -37,6 +37,7 @@ from pyftg.socket.aio.gateway import Gateway
 from pyftg.socket.aio.stream_controller import StreamController
 from pyftg.socket.utils.asyncio import recv_data, send_data
 
+from leworldgaming.data.replay_buffer import ReplayBuffer
 from leworldgaming.env.fightingice_env import _to_pixel_tensor
 from leworldgaming.env.spectator_recorder import SpectatorRecorder
 from leworldgaming.env.state_vector import frame_to_obs_dict
@@ -96,6 +97,7 @@ class _SelfDrivingAI(AIInterface):
         max_hp: float = 400.0,
         max_energy: float = 300.0,
         frame_skip: int = 1,
+        record_buffer: ReplayBuffer | None = None,
     ) -> None:
         self._name = name
         self._agent = agent
@@ -106,6 +108,18 @@ class _SelfDrivingAI(AIInterface):
         self._max_hp = max_hp
         self._max_energy = max_energy
         self._frame_skip = max(1, int(frame_skip))
+        # Optional live-match recorder: writes every executed-action frame
+        # to a ReplayBuffer with BOTH sides' true actions in obs/own/action
+        # and obs/opp/action (frame_to_obs_dict already reads both
+        # characters' realized .action off the JVM's FrameData -- see
+        # docs/opponent_conditioning_research_2026-07-16.md section 3).
+        # Used to collect opponent-action-labelled data against a specific
+        # live opponent (e.g. Dreamer) that collect_data.py's JVM-AI-only
+        # path can't target.
+        self._record_buffer = record_buffer
+        self._prev_hp_self: int | None = None
+        self._prev_hp_opp: int | None = None
+        self._steps_in_episode = 0
         # Real-time decision-latency profiler (see
         # docs/lewm_stride2_vs_dreamer_2026-07-19.md — this was the missing
         # measurement needed to confirm/deny "heavier planner search loses
@@ -273,10 +287,49 @@ class _SelfDrivingAI(AIInterface):
         else:
             self._clear_noop()
 
+        if self._record_buffer is not None:
+            self._record_transition(own, opp, frame_no)
+
+    def _record_transition(self, own: Any, opp: Any, frame_no: int) -> None:
+        """Write one (own+opp true action, reward, ...) row. Runs every raw
+        JVM frame regardless of frame_skip, mirroring RecordingAI's own
+        per-frame recording semantics -- the *executed* action (held over
+        from the last decision if frame_skip>1) is what actually produced
+        this frame's dynamics, which is what the world model needs to learn
+        from, not just the frames where a fresh decision was made."""
+        obs = frame_to_obs_dict(
+            self._frame_data, self._player_number,
+            max_hp=self._max_hp, max_energy=self._max_energy,
+        )
+        if self._prev_hp_self is None:
+            reward = 0.0
+        else:
+            damage_dealt = self._prev_hp_opp - opp.hp
+            damage_taken = self._prev_hp_self - own.hp
+            reward = float(damage_dealt - damage_taken) / max(self._max_hp, 1.0)
+        pixels = self._pixel_source.latest_pixels() if self._pixel_source else None
+        assert self._pending_action is not None
+        self._record_buffer.add(
+            obs_dict=obs,
+            action=self._pending_action.to_int(),
+            reward=reward,
+            done=False,
+            is_first=(self._steps_in_episode == 0),
+            pixels=pixels,
+        )
+        self._prev_hp_self = own.hp
+        self._prev_hp_opp = opp.hp
+        self._steps_in_episode += 1
+
     def input(self) -> Key:
         return self._key
 
     def round_end(self, round_result: RoundResult) -> None:
+        if self._record_buffer is not None and self._steps_in_episode > 0:
+            self._record_buffer.end_episode()
+        self._prev_hp_self = None
+        self._prev_hp_opp = None
+        self._steps_in_episode = 0
         self._need_reset = True
         self._pending_action = None
         self._skip_ctr = 0
@@ -340,15 +393,17 @@ async def _run_match_async(
     character: str = "ZEN",
     games: int = 1,
     image_size: int = 224,
+    record_buffer: ReplayBuffer | None = None,
+    record_pixels: bool = False,
 ) -> MatchResult:
     outcomes: list[RoundOutcome] = []
-    needs_pixels = p1_obs_mode == "pixel" or p2_obs_mode == "pixel"
+    needs_pixels = p1_obs_mode == "pixel" or p2_obs_mode == "pixel" or record_pixels
     spectator = SpectatorRecorder(image_size=image_size) if needs_pixels else None
 
     gateway = Gateway(host=host, port=port)
     ai_p1 = _SelfDrivingAI(
         p1_name, p1_agent, p1_obs_mode, image_size, spectator, outcomes,
-        frame_skip=p1_frame_skip,
+        frame_skip=p1_frame_skip, record_buffer=record_buffer,
     )
     ai_p2 = _SelfDrivingAI(
         p2_name, p2_agent, p2_obs_mode, image_size, spectator, outcomes,

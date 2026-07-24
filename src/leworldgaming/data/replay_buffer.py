@@ -560,8 +560,16 @@ def _read_windows(
     for group_path, schema in GROUPS.items():
         side_key = group_path.split("/")[-1]
         for name in schema:
+            ds_path = f"{group_path}/{name}"
+            if ds_path not in f:
+                # Older replay files predate a field added to the schema
+                # later (e.g. per-char "action", added 2026-07-20 for
+                # opponent-conditioning research) -- skip it rather than
+                # crash the whole read, so old + new .h5 files can still be
+                # mixed in one DataReader for fields that DO exist in both.
+                continue
             out[f"{side_key}/{name}"] = _gather_seq(
-                f[f"{group_path}/{name}"], picks, seq_len, stride
+                f[ds_path], picks, seq_len, stride
             )
 
     if "pixels" in f:

@@ -138,6 +138,12 @@ def _score_action_sequences(
     gamma: float,
     uncertainty_penalty: float = 0.0,
     sub_actions: torch.Tensor | None = None,
+    value_weight: float = 1.0,
+    reward_clip: float = 0.0,
+    idle_action_ids: torch.Tensor | None = None,
+    idle_penalty: float = 0.0,
+    repeat_penalty: float = 0.0,
+    prev_action: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Roll ``actions`` (S, H) forward through the latent predictor and return
     a discounted-return score per sample. Shared by ``random_shooting`` (one
@@ -151,6 +157,23 @@ def _score_action_sequences(
     still uses the repeated-block encoding, since past decisions really were
     a single action held for the whole block); the block-ending action is
     still folded into ``action_hist`` for conditioning subsequent blocks.
+
+    ``repeat_penalty``: subtract a fixed cost, per planned raw frame, for
+    every frame whose action equals the *immediately preceding* raw frame's
+    action (within the plan, and against ``prev_action`` -- the actually-
+    executed previous decision -- for the very first planned frame). This is
+    a deliberate anti-``sticky_prob``/anti-lock-in counterweight: the
+    reward/value heads alone often can't distinguish "hold the same stance
+    for 100 frames" from "press a fresh useful button" once the score
+    landscape is flat (same rationale as ``idle_penalty``, but targeting
+    *any* repeated action, not just a fixed no-op set -- e.g. a real live
+    failure mode was the agent locking onto one guard/dash action for
+    seconds at a time). ``0.0`` (default) disables it, reproducing old
+    behavior exactly. ``prev_action``: optional ``(S,)`` tensor of the
+    action actually executed on the previous real decision (not merely
+    planned) -- lets the very first planned frame be penalized for
+    repeating what just really happened, closing the loophole where a
+    penalty-free plan could still visibly repeat across decision boundaries.
     """
     if sub_actions is not None:
         s = sub_actions.shape[0]
@@ -161,6 +184,10 @@ def _score_action_sequences(
     device = z_hist.device
     scores = torch.zeros(s, device=device)
     discount = torch.ones(s, device=device)
+    idle_set = None
+    if idle_penalty > 0.0 and idle_action_ids is not None and idle_action_ids.numel() > 0:
+        idle_set = idle_action_ids.to(device=device, dtype=torch.long)
+    _prev_raw_action = prev_action.to(device=device, dtype=torch.long) if prev_action is not None else None
 
     for t in range(horizon):
         if sub_actions is not None:
@@ -181,15 +208,53 @@ def _score_action_sequences(
             action_blocks = _repeat_action_blocks(
                 action_window, num_actions, temporal_stride
             )
+        # (#3 idle/no-op penalty) Subtract a fixed cost for every planned
+        # frame whose action is a deliberate no-op (e.g. NEUTRAL). The
+        # reward/value heads are known-noisy on rare decisive frames (see
+        # docs/lewm_calibration_audit_and_ensembling_2026-07-20.md), so a
+        # trajectory that just stands still can score approximately as well
+        # as one that presses an attack -- CEM has nothing pushing it away
+        # from the "safe" degenerate no-op once the score landscape is flat.
+        # This is an explicit, deterministic anti-idle bias independent of
+        # head calibration. ``idle_penalty <= 0`` (default) disables it,
+        # reproducing old behavior exactly.
+        if idle_set is not None:
+            if sub_actions is not None:
+                is_idle = torch.isin(sub_actions[:, t], idle_set).float().mean(dim=-1)
+            else:
+                is_idle = torch.isin(actions[:, t], idle_set).float()
+            scores.sub_(discount * idle_penalty * is_idle)
+        if repeat_penalty > 0.0:
+            if sub_actions is not None:
+                cur_raw = sub_actions[:, t]  # (S, temporal_stride)
+                if t == 0:
+                    prev_raw = _prev_raw_action.unsqueeze(-1) if _prev_raw_action is not None else None
+                else:
+                    prev_raw = sub_actions[:, t - 1, -1:]
+                if prev_raw is not None:
+                    lead = torch.cat([prev_raw, cur_raw[:, :-1]], dim=-1)
+                    is_repeat = (cur_raw == lead).float().mean(dim=-1)
+                    scores.sub_(discount * repeat_penalty * is_repeat)
+            else:
+                if t == 0:
+                    prev_a = _prev_raw_action
+                else:
+                    prev_a = actions[:, t - 1]
+                if prev_a is not None:
+                    is_repeat = (actions[:, t] == prev_a).float()
+                    scores.sub_(discount * repeat_penalty * is_repeat)
         a_hist_emb = action_encoder(action_blocks)
         if reward_head is not None and reward_bins is not None:
-            scores.add_(
-                discount
-                * _decode_pessimistic(
-                    reward_head, reward_bins, uncertainty_penalty,
-                    z_hist[:, -1], a_hist_emb[:, -1],
-                )
+            step_reward = _decode_pessimistic(
+                reward_head, reward_bins, uncertainty_penalty,
+                z_hist[:, -1], a_hist_emb[:, -1],
             )
+            # (#2) Winsorize per-step reward: cap the magnitude of any single
+            # imagined frame's reward so CEM cannot chase one hallucinated
+            # big hit into an unreliable latent. ``reward_clip <= 0`` disables.
+            if reward_clip > 0.0:
+                step_reward = step_reward.clamp(-reward_clip, reward_clip)
+            scores.add_(discount * step_reward)
         z_pred_seq = predictor(z_hist, a_hist_emb)  # (S, HS, D)
         z_next = pred_proj(z_pred_seq[:, -1])  # (S, D)
         if continuation_head is not None:
@@ -208,12 +273,17 @@ def _score_action_sequences(
 
     final_z = z_hist[:, -1]  # (S, D)
     if value_head is not None and value_bins is not None:
+        # (#2) Down-weight the terminal value head -- it is the noisiest part
+        # of the score on this game, so trusting it at weight 1.0 lets CEM
+        # exploit its miscalibration. ``value_weight`` (default 1.0) is a
+        # planner-only knob; 0.3-0.7 leans on per-step reward instead.
         scores.add_(
-            discount
+            value_weight
+            * discount
             * _decode_pessimistic(value_head, value_bins, uncertainty_penalty, final_z)
         )
     elif reward_head is None:
-        scores = probe(final_z)[:, 0]
+        scores = scores + probe(final_z)[:, 0]
     return scores
 
 
@@ -304,6 +374,14 @@ def cem_shooting(
     uncertainty_penalty: float = 0.0,
     warm_shift: int = 1,
     plan_raw_actions: bool = False,
+    elite_temp: float = 0.0,
+    value_weight: float = 1.0,
+    reward_clip: float = 0.0,
+    idle_action_ids: torch.Tensor | None = None,
+    idle_penalty: float = 0.0,
+    policy_prior: torch.Tensor | None = None,
+    repeat_penalty: float = 0.0,
+    prev_action: int | None = None,
 ) -> tuple[int, torch.Tensor]:
     """Discrete iCEM-style planner (Pinneri et al., "Sample-efficient
     Cross-Entropy Method for Real-time Planning", CoRL 2020, arXiv:2008.06389).
@@ -406,6 +484,10 @@ def cem_shooting(
         z_context, past_actions, s, history_size, device
     )
 
+    _prev_action_tensor = None
+    if repeat_penalty > 0.0 and prev_action is not None:
+        _prev_action_tensor = torch.full((s,), int(prev_action), dtype=torch.long, device=device)
+
     # ``plan_len`` is the number of rows ``dist`` maintains: one per planned
     # *block* (default) or one per planned *raw frame* across the whole span
     # (``plan_raw_actions=True``, ``plan_len = horizon * temporal_stride``).
@@ -418,16 +500,44 @@ def cem_shooting(
     else:
         uniform_row.fill_(1.0 / num_actions)
 
+    # (#4 policy-prior warm start, TD-MPC2/Sampled-MuZero style) Replace the
+    # blind-uniform initial row with a behavior-cloned prior over actions
+    # (see policy_head.py) when supplied. This ONLY changes what CEM's
+    # first iteration samples from (and the exploration floor every
+    # subsequent iteration, in place of ``uniform_row``) -- every sampled
+    # trajectory is still scored by the exact same reward/value heads and
+    # dist is still refit from real scores every iteration, so a
+    # miscalibrated/stale prior can only cost a couple of extra
+    # elite-refinement iterations to correct, never silently override
+    # planner judgment. Falls back to ``uniform_row`` exactly (identical
+    # behavior to before this feature existed) when ``policy_prior is None``.
+    init_row = uniform_row
+    if policy_prior is not None:
+        init_row = policy_prior.to(device=device, dtype=uniform_row.dtype)
+        if valid_actions is not None:
+            # Re-mask + renormalize over only the valid/playable actions so
+            # an untrained/leaky prior can never put mass on unplayable
+            # "state observation" ids (see agent.py's _commandable_action_ids
+            # docstring for why that's a known failure mode).
+            mask = torch.zeros_like(init_row)
+            mask[valid_actions] = 1.0
+            init_row = init_row * mask
+        total = init_row.sum()
+        if total > 0:
+            init_row = init_row / total
+        else:
+            init_row = uniform_row
+
     if init_dist is None:
-        dist = uniform_row.unsqueeze(0).expand(plan_len, -1).contiguous()
+        dist = init_row.unsqueeze(0).expand(plan_len, -1).contiguous()
     else:
         # Warm start: shift the previous plan forward by the number of
         # steps already executed since it was computed (1 in the original
         # per-decision-replan design; >1 when running in chunked mode) and
-        # pad fresh uniform rows at the end for the newly-exposed horizon.
+        # pad fresh prior-row(s) at the end for the newly-exposed horizon.
         shift = max(1, int(warm_shift))
         dist = torch.cat(
-            [init_dist.to(device)[shift:], uniform_row.unsqueeze(0).expand(min(shift, plan_len), -1)],
+            [init_dist.to(device)[shift:], init_row.unsqueeze(0).expand(min(shift, plan_len), -1)],
             dim=0,
         )
 
@@ -450,20 +560,38 @@ def cem_shooting(
                 probe, num_actions, temporal_stride, reward_head, continuation_head,
                 value_head, reward_bins, value_bins, gamma, uncertainty_penalty,
                 sub_actions=sub_actions,
+                value_weight=value_weight, reward_clip=reward_clip,
+                idle_action_ids=idle_action_ids, idle_penalty=idle_penalty,
+                repeat_penalty=repeat_penalty, prev_action=_prev_action_tensor,
             )
         else:
             scores = _score_action_sequences(
                 z_hist, action_hist, actions, predictor, pred_proj, action_encoder,
                 probe, num_actions, temporal_stride, reward_head, continuation_head,
                 value_head, reward_bins, value_bins, gamma, uncertainty_penalty,
+                value_weight=value_weight, reward_clip=reward_clip,
+                idle_action_ids=idle_action_ids, idle_penalty=idle_penalty,
+                repeat_penalty=repeat_penalty, prev_action=_prev_action_tensor,
             )
         elite_idx = scores.topk(min(elite_k, s)).indices
         elite_actions = actions[elite_idx]  # (elite_k, plan_len)
 
         new_dist = torch.zeros((plan_len, num_actions), device=device)
-        for t in range(plan_len):
-            counts = torch.bincount(elite_actions[:, t], minlength=num_actions).float()
-            new_dist[t] = counts / counts.sum().clamp_min(1.0)
+        if elite_temp > 0.0:
+            # (#1) Soft / Boltzmann elite update (MPPI-style): instead of a
+            # hard 0/1 top-k count, weight the elites by softmax(score/temp)
+            # so the full score ranking within the elite set shapes the
+            # refit. Far more sample-efficient at low ``num_samples`` than a
+            # hard cutoff -- the standard reason MPPI beats vanilla CEM.
+            elite_scores = scores[elite_idx]  # (elite_k,)
+            w = torch.softmax(elite_scores / elite_temp, dim=0)  # (elite_k,)
+            for t in range(plan_len):
+                oh = F.one_hot(elite_actions[:, t], num_classes=num_actions).float()
+                new_dist[t] = (w.unsqueeze(-1) * oh).sum(dim=0)
+        else:
+            for t in range(plan_len):
+                counts = torch.bincount(elite_actions[:, t], minlength=num_actions).float()
+                new_dist[t] = counts / counts.sum().clamp_min(1.0)
         new_dist = (1.0 - min_prob) * new_dist + min_prob * uniform_row
         dist = momentum * dist + (1.0 - momentum) * new_dist
         dist = dist / dist.sum(dim=-1, keepdim=True)

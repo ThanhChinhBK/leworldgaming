@@ -196,6 +196,9 @@ def train(
             return {"val_delta_mse": float(np.mean(mses))}
 
         t0 = time.time()
+        best_val_mse = [float("inf")]
+        best_step = [start_step]
+        best_state = [None]
         for step in range(start_step, num_steps):
             batch = _sample_transition_batch(reader, train_starts, batch_size, rng, max_hp)
             metrics = agent.learn(batch)
@@ -230,6 +233,17 @@ def train(
                 vm["step"] = step
                 val_history.append(vm)
                 print(f"[train_pets] step={step:5d}  val  mse={vm['val_delta_mse']:.4f}")
+                if vm["val_delta_mse"] < best_val_mse[0]:
+                    best_val_mse[0] = vm["val_delta_mse"]
+                    best_step[0] = step
+                    best_state[0] = {
+                        k: v.detach().clone()
+                        for k, v in agent.dynamics.state_dict().items()
+                    }
+                    print(
+                        f"[train_pets] step={step:5d}  new best val mse="
+                        f"{vm['val_delta_mse']:.4f} -- state snapshotted (in-memory)"
+                    )
 
             if ckpt_every > 0 and step > 0 and step % ckpt_every == 0:
                 _save_ckpt(step, ckpt_path)
@@ -243,6 +257,22 @@ def train(
 
     _save_ckpt(num_steps, ckpt_path)
     print(f"[train_pets] saved checkpoint -> {ckpt_path}")
+
+    # Best-val-snapshot swap-in (mirrors train_lewm_heads.py's continuation-
+    # head handling): the ensemble dynamics loss is known-noisy per-batch
+    # (occasional heavy-tailed HP-swing transitions spike NLL/MSE far above
+    # the running mean) and can start mildly overfitting well before
+    # ``num_steps`` -- restoring the best-val-MSE state dict before the
+    # final save avoids shipping a checkpoint from past the point where val
+    # error was still improving.
+    if best_state[0] is not None and best_step[0] != num_steps:
+        agent.dynamics.load_state_dict(best_state[0])
+        _save_ckpt(best_step[0], ckpt_path)
+        print(
+            f"[train_pets] saved checkpoint -> {ckpt_path} "
+            f"(dynamics swapped to its best-val snapshot, step={best_step[0]}, "
+            f"val_delta_mse={best_val_mse[0]:.4f})"
+        )
 
     return {
         "ckpt_path": str(ckpt_path),

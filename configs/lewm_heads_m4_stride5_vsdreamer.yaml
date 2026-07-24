@@ -1,0 +1,49 @@
+# Stage-B head trainer config, retrain-on-real-vs-Dreamer-data variant.
+#
+# Same Stage-A encoder/predictor (frozen, unchanged) as
+# lewm_heads_checkpoint_stride5_m4_v3.pt -- only the small reward/
+# continuation/value heads are retrained, on the fresh dataset collected
+# 2026-07-23 (real scripted-policy-vs-live-DreamerV3 matches, native JVM,
+# --grey-bg, genuine obs/opp/action labels + pixels). Previous heads never
+# saw a real DreamerV3 opponent at all; this retrain closes that gap
+# directly (as opposed to the negative post-hoc overlay results this
+# session, which left the heads untouched and only reweighted planner
+# output).
+
+heads:
+  reward_bins: 41
+  reward_low: -1.0
+  reward_high: 1.0
+  value_bins: 41
+  value_low: -10.0
+  value_high: 10.0
+  hidden_dim: 512
+  imagined_horizon: 5
+  lambda_return: 0.95
+  gamma: 0.997
+  target_ema: 0.99
+  reward_loss_weight: 1.0
+  cont_loss_weight: 1.0
+  value_loss_weight: 1.0
+  imagined_loss_weight: 1.0
+  probe_loss_weight: 0.0
+  terminal_window_fraction: 0.1
+  cont_dropout: 0.35
+  cont_hidden_dim: 64
+
+batch_size: 16
+lr: 3.0e-4
+weight_decay: 1.0e-3
+cont_weight_decay: 0.05
+grad_clip: 1.0
+
+# I/O -- points at the fresh dataset instead of the old one.
+data_path: /media/jeovach/Hoctap/leword-opponent
+ckpt_in: data/lewm_checkpoint_stride5.pt
+ckpt_out: data/lewm_heads_checkpoint_stride5_m4_vsdreamer.pt
+log_every: 10
+val_split: 0.1
+val_every: 500
+val_batches: 8
+ckpt_every: 2000
+seed: 0

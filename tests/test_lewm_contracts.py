@@ -13,6 +13,7 @@ from leworldgaming.agents.lewm.action_encoder import ActionEncoder
 from leworldgaming.agents.lewm.planner import (
     _decode_pessimistic,
     _repeat_action_blocks,
+    cem_shooting,
     random_shooting,
 )
 from leworldgaming.agents.lewm.twohot import make_bins, twohot_decode
@@ -209,6 +210,260 @@ class _ConstantLogitsHead(nn.Module):
 
     def forward(self, z: torch.Tensor, *args: torch.Tensor) -> torch.Tensor:
         return self.logits.unsqueeze(0).expand(z.shape[0], -1)
+
+
+class PlannerSoftUpdateTests(unittest.TestCase):
+    """#1 (MPPI soft update) + #2 (value_weight / reward_clip) knobs."""
+
+    def _common(self):
+        latent_dim = 8
+        return dict(
+            predictor=_IdentityPredictor(),
+            pred_proj=nn.Identity(),
+            action_encoder=ActionEncoder(
+                action_dim=6 * 1, emb_dim=latent_dim, smoothed_dim=10
+            ),
+            probe=_FirstCoordinateProbe(),
+            num_actions=6,
+            horizon=2,
+            num_samples=16,
+            num_iters=2,
+            history_size=3,
+            temporal_stride=1,
+        ), latent_dim
+
+    def test_soft_update_runs_and_returns_valid_action(self) -> None:
+        common, latent_dim = self._common()
+        torch.manual_seed(0)
+        action, dist = cem_shooting(
+            torch.zeros(3, latent_dim), **common, elite_temp=1.0,
+        )
+        self.assertTrue(0 <= action < 6)
+        # dist rows are valid probability distributions.
+        self.assertEqual(dist.shape[-1], 6)
+        torch.testing.assert_close(
+            dist.sum(dim=-1), torch.ones(dist.shape[0]), atol=1e-4, rtol=0
+        )
+
+    def test_soft_update_favors_higher_scoring_action(self) -> None:
+        # Probe returns first latent coord; _IdentityPredictor makes the
+        # rollout track the encoded action, so distinct actions score
+        # differently. A very low temperature (near-hard) elite refit should
+        # still produce a normalized, peaked dist -- exercising the softmax
+        # path without NaNs at small temp.
+        common, latent_dim = self._common()
+        torch.manual_seed(1)
+        _, dist = cem_shooting(
+            torch.zeros(2, latent_dim), **common, elite_temp=0.05,
+        )
+        self.assertTrue(torch.isfinite(dist).all())
+        self.assertGreater(dist[0].max().item(), 0.0)
+
+    def test_value_weight_and_reward_clip_accepted(self) -> None:
+        common, latent_dim = self._common()
+        torch.manual_seed(2)
+        action, _ = cem_shooting(
+            torch.zeros(2, latent_dim), **common,
+            value_weight=0.5, reward_clip=1.0, elite_temp=0.0,
+        )
+        self.assertTrue(0 <= action < 6)
+
+    def test_idle_penalty_suppresses_idle_action_in_dist(self) -> None:
+        # With no reward/value heads (flat score everywhere), an idle
+        # penalty on action id 0 should push probability mass at dist[0]
+        # away from action 0 relative to no penalty at all.
+        common, latent_dim = self._common()
+        idle_ids = torch.tensor([0], dtype=torch.long)
+        torch.manual_seed(3)
+        _, dist_off = cem_shooting(
+            torch.zeros(2, latent_dim), **common,
+            idle_action_ids=idle_ids, idle_penalty=0.0,
+        )
+        torch.manual_seed(3)
+        _, dist_on = cem_shooting(
+            torch.zeros(2, latent_dim), **common,
+            idle_action_ids=idle_ids, idle_penalty=5.0,
+        )
+        self.assertLess(dist_on[0, 0].item(), dist_off[0, 0].item())
+
+    def test_idle_penalty_zero_is_noop(self) -> None:
+        common, latent_dim = self._common()
+        idle_ids = torch.tensor([0], dtype=torch.long)
+        torch.manual_seed(4)
+        action_a, dist_a = cem_shooting(
+            torch.zeros(2, latent_dim), **common,
+            idle_action_ids=idle_ids, idle_penalty=0.0,
+        )
+        torch.manual_seed(4)
+        action_b, dist_b = cem_shooting(
+            torch.zeros(2, latent_dim), **common,
+            idle_action_ids=None, idle_penalty=0.0,
+        )
+        self.assertEqual(action_a, action_b)
+        torch.testing.assert_close(dist_a, dist_b)
+
+    def test_repeat_penalty_suppresses_repeat_of_prev_action(self) -> None:
+        # With no reward/value heads (flat score everywhere), a repeat
+        # penalty should push dist[0] away from prev_action relative to no
+        # penalty at all -- the planner should prefer switching actions.
+        common, latent_dim = self._common()
+        common["num_samples"] = 512
+        torch.manual_seed(6)
+        _, dist_off = cem_shooting(
+            torch.zeros(2, latent_dim), **common,
+            repeat_penalty=0.0, prev_action=2,
+        )
+        torch.manual_seed(6)
+        _, dist_on = cem_shooting(
+            torch.zeros(2, latent_dim), **common,
+            repeat_penalty=20.0, prev_action=2,
+        )
+        self.assertLess(dist_on[0, 2].item(), dist_off[0, 2].item())
+
+    def test_repeat_penalty_zero_is_noop(self) -> None:
+        common, latent_dim = self._common()
+        torch.manual_seed(7)
+        action_a, dist_a = cem_shooting(
+            torch.zeros(2, latent_dim), **common,
+            repeat_penalty=0.0, prev_action=None,
+        )
+        torch.manual_seed(7)
+        action_b, dist_b = cem_shooting(
+            torch.zeros(2, latent_dim), **common,
+            repeat_penalty=0.0, prev_action=3,
+        )
+        self.assertEqual(action_a, action_b)
+        torch.testing.assert_close(dist_a, dist_b)
+
+    def test_policy_prior_shapes_initial_dist(self) -> None:
+        # With no reward/value heads (flat score everywhere) and num_iters=1,
+        # a peaked policy_prior should visibly bias the resulting elite-count
+        # dist toward the prior's favored action relative to plain uniform
+        # init, since CEM's first iteration samples straight from init_dist.
+        common, latent_dim = self._common()
+        prior = torch.zeros(6)
+        prior[3] = 1.0
+        torch.manual_seed(5)
+        _, dist_uniform = cem_shooting(
+            torch.zeros(2, latent_dim), **common, policy_prior=None,
+        )
+        torch.manual_seed(5)
+        _, dist_prior = cem_shooting(
+            torch.zeros(2, latent_dim), **common, policy_prior=prior,
+        )
+        self.assertGreater(dist_prior[0, 3].item(), dist_uniform[0, 3].item())
+
+    def test_policy_prior_none_is_noop(self) -> None:
+        common, latent_dim = self._common()
+        torch.manual_seed(6)
+        action_a, dist_a = cem_shooting(
+            torch.zeros(2, latent_dim), **common, policy_prior=None,
+        )
+        torch.manual_seed(6)
+        action_b, dist_b = cem_shooting(
+            torch.zeros(2, latent_dim), **common,
+        )
+        self.assertEqual(action_a, action_b)
+        torch.testing.assert_close(dist_a, dist_b)
+
+    def test_policy_prior_masked_to_valid_actions(self) -> None:
+        # A prior that puts all its mass on an invalid action must fall back
+        # to uniform-over-valid rather than silently biasing toward an
+        # action CEM isn't allowed to sample.
+        common, latent_dim = self._common()
+        valid = torch.tensor([0, 1, 2], dtype=torch.long)
+        prior = torch.zeros(6)
+        prior[5] = 1.0  # outside `valid`
+        torch.manual_seed(7)
+        action, dist = cem_shooting(
+            torch.zeros(2, latent_dim),
+            **{**common, "valid_actions": valid},
+            policy_prior=prior,
+        )
+        self.assertIn(action, (0, 1, 2))
+        self.assertAlmostEqual(dist[0, 3].item(), 0.0, places=5)
+        self.assertAlmostEqual(dist[0, 4].item(), 0.0, places=5)
+        self.assertAlmostEqual(dist[0, 5].item(), 0.0, places=5)
+
+
+class OnlineOpponentModelTests(unittest.TestCase):
+    def _obs(self, attacking: bool, hp: float = 400.0) -> dict:
+        return {
+            "own": {"x": 100, "y": 0, "hp": hp, "energy": 50},
+            "opp": {
+                "x": 130, "y": 0, "hp": 300, "energy": 50,
+                "action": 35 if attacking else 1,
+                "atk_is_live": 1 if attacking else 0,
+                "atk_start_up": 3 if attacking else 0,
+                "control": 1,
+            },
+            "global": {"max_hp": 400, "proj_opp": 0},
+        }
+
+    def test_online_fit_separates_threat(self) -> None:
+        from leworldgaming.agents.lewm.online_opponent_model import (
+            OnlineOpponentModel,
+        )
+        om = OnlineOpponentModel(lr=0.02)
+        hp = 400.0
+        for t in range(3000):
+            attacking = (t % 3 == 0)
+            obs = self._obs(attacking, hp)
+            om.observe_outcome(obs)
+            om.predict_threat(obs)
+            if attacking:
+                hp -= 8.0
+                if hp <= 4.0:
+                    hp = 400.0
+        p_attack = om.predict_threat(self._obs(True, hp))
+        p_idle = om.predict_threat(self._obs(False, hp))
+        # After online training the threat estimate should clearly separate
+        # an attacking opponent from an idle one.
+        self.assertGreater(p_attack, 0.7)
+        self.assertLess(p_idle, 0.3)
+
+    def test_bias_direction_and_normalization(self) -> None:
+        import numpy as np
+        from leworldgaming.agents.lewm.online_opponent_model import (
+            OnlineOpponentModel,
+            _ATTACK_IDS,
+            _EVASION_IDS,
+            _GUARD_IDS,
+        )
+        om = OnlineOpponentModel(strength=1.5)
+        dist = np.ones(56) / 56.0
+        threatened = om.bias_action_dist(dist.copy(), 0.95)
+        safe = om.bias_action_dist(dist.copy(), 0.05)
+        # Distributions stay normalized.
+        self.assertAlmostEqual(float(threatened.sum()), 1.0, places=5)
+        self.assertAlmostEqual(float(safe.sum()), 1.0, places=5)
+        defend_ids = list(_GUARD_IDS + _EVASION_IDS)
+        attack_ids = list(_ATTACK_IDS)
+        # Under threat, defensive mass rises vs uniform and attack mass falls.
+        self.assertGreater(threatened[defend_ids].sum(), dist[defend_ids].sum())
+        self.assertLess(threatened[attack_ids].sum(), dist[attack_ids].sum())
+        # When safe, attack mass rises vs uniform.
+        self.assertGreater(safe[attack_ids].sum(), dist[attack_ids].sum())
+
+    def test_neutral_threat_is_noop(self) -> None:
+        import numpy as np
+        from leworldgaming.agents.lewm.online_opponent_model import (
+            OnlineOpponentModel,
+        )
+        om = OnlineOpponentModel(strength=1.5)
+        dist = np.ones(56) / 56.0
+        out = om.bias_action_dist(dist.copy(), 0.5)  # == threshold
+        np.testing.assert_allclose(out, dist)
+
+    def test_missing_keys_never_crash(self) -> None:
+        from leworldgaming.agents.lewm.online_opponent_model import (
+            OnlineOpponentModel,
+        )
+        om = OnlineOpponentModel()
+        # Empty / partial obs should not raise.
+        om.observe_outcome({})
+        p = om.predict_threat({})
+        self.assertTrue(0.0 <= p <= 1.0)
 
 
 if __name__ == "__main__":

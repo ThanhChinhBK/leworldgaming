@@ -45,6 +45,7 @@ from torch.nn import functional as F
 from leworldgaming.agents.lewm.action_encoder import ActionEncoder
 from leworldgaming.agents.lewm.continuation_head import ContinuationHead
 from leworldgaming.agents.lewm.encoder import Encoder
+from leworldgaming.agents.lewm.policy_head import PolicyHead
 from leworldgaming.agents.lewm.predictor import Predictor
 from leworldgaming.agents.lewm.probe import LinearProbe
 from leworldgaming.agents.lewm.projector import Projector
@@ -104,6 +105,12 @@ DEFAULTS: dict[str, Any] = {
         # full backward compatibility with LewmAgent/older checkpoints).
         "reward_ensemble_size": 1,
         "value_ensemble_size": 1,
+        # Policy-prior head (BC warm-start for CEM, see policy_head.py):
+        # cross-entropy on the recorded executed action at every grounded
+        # step. 0.0 (default) disables it -- no architecture change to any
+        # existing checkpoint/consumer when unused.
+        "policy_loss_weight": 0.0,
+        "policy_hidden_dim": 256,
     },
     "batch_size": 16,
     "lr": 3.0e-4,
@@ -397,6 +404,15 @@ def train(
     probe_targets = list(hcfg["probe_targets"])
     probe = LinearProbe(latent_dim=latent_dim, target_dim=len(probe_targets)).to(device)
 
+    w_policy = float(hcfg.get("policy_loss_weight", 0.0))
+    policy_head: PolicyHead | None = None
+    if w_policy > 0.0:
+        policy_head = PolicyHead(
+            latent_dim=latent_dim,
+            hidden_dim=int(hcfg.get("policy_hidden_dim", 256)),
+            num_actions=action_dim,
+        ).to(device)
+
     reward_bins = make_bins(int(hcfg["reward_bins"]), float(hcfg["reward_low"]), float(hcfg["reward_high"]), device)
     value_bins = make_bins(int(hcfg["value_bins"]), float(hcfg["value_low"]), float(hcfg["value_high"]), device)
 
@@ -406,6 +422,8 @@ def train(
         "value_heads": value_heads,
         "probe": probe,
     })
+    if policy_head is not None:
+        head_modules["policy_head"] = policy_head
     n_params = sum(p.numel() for p in head_modules.parameters()) / 1e6
     print(f"[train_lewm_heads] head params: {n_params:.2f}M (reward_ensemble={n_reward} value_ensemble={n_value}) (frozen JEPA: {sum(p.numel() for p in jepa['encoder'].parameters() if not p.requires_grad) / 1e6:.2f}M+ ...)")
 
@@ -445,8 +463,18 @@ def train(
             value_target_heads, resume_ckpt, "value_target_heads", "value_target_head"
         )
         probe.load_state_dict(resume_ckpt["probe"])
-        if "optim" in resume_ckpt:
+        if policy_head is not None and resume_ckpt.get("policy_head") is not None:
+            policy_head.load_state_dict(resume_ckpt["policy_head"])
+        _policy_added_fresh = policy_head is not None and resume_ckpt.get("policy_head") is None
+        if "optim" in resume_ckpt and not _policy_added_fresh:
             optim.load_state_dict(resume_ckpt["optim"])
+        elif _policy_added_fresh:
+            print(
+                "[train_lewm_heads] policy_head is new in this run (not present in "
+                "resumed checkpoint) -- optimizer state NOT restored (param groups "
+                "changed shape); all head params restart with a fresh AdamW state "
+                "but keep their loaded weights."
+            )
         start_step = int(resume_ckpt.get("num_steps", 0))
         print(
             f"[train_lewm_heads] resumed from {ckpt_out} at step={start_step} "
@@ -534,6 +562,7 @@ def train(
         rewards: torch.Tensor,
         dones: torch.Tensor,
         state_vec: torch.Tensor | None = None,
+        policy_targets: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         z_states = _encode_grounded(pixels)             # (B, T+1, D)
         z = z_states[:, :transition_len]                # current states
@@ -624,6 +653,22 @@ def train(
             loss = loss + w_probe * loss_probe
             loss_probe_val = loss_probe.detach()
 
+        loss_policy_val = torch.zeros((), device=device)
+        if policy_head is not None and w_policy > 0.0 and policy_targets is not None:
+            # Behavior-cloning CE on the recorded executed action at each
+            # GROUNDED step z[t] (not the imagined rollout -- this head is a
+            # CEM warm-start prior, not a planning-time-critical component,
+            # so only supervising grounded latents keeps it simple and
+            # avoids the imagined-rollout compute/complexity of the reward/
+            # continuation heads' M4 branch above).
+            policy_logits = policy_head(z)                    # (B, T, A)
+            loss_policy = F.cross_entropy(
+                policy_logits.reshape(-1, policy_logits.shape[-1]),
+                policy_targets.reshape(-1),
+            )
+            loss = loss + w_policy * loss_policy
+            loss_policy_val = loss_policy.detach()
+
         return {
             "loss": loss,
             "loss_r": loss_r.detach(),
@@ -633,6 +678,7 @@ def train(
             "loss_r_im": loss_r_im_val,
             "loss_c_im": loss_c_im_val,
             "loss_probe": loss_probe_val,
+            "loss_policy": loss_policy_val,
             "z_norm": z_states.float().norm(dim=-1).mean().detach(),
         }
 
@@ -675,7 +721,7 @@ def train(
             starts,
             terminal_starts,
             batch_rng: np.random.Generator,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
             terminal_count = 0
             if terminal_starts.size > 0 and terminal_window_fraction > 0.0:
                 terminal_count = min(
@@ -713,7 +759,19 @@ def train(
             state_vec: torch.Tensor | None = None
             if "state_vector" in batch:
                 state_vec = torch.from_numpy(batch["state_vector"]).to(device, dtype=torch.float32)
-            return pixels, a_oh, rewards, dones, state_vec
+            policy_targets: torch.Tensor | None = None
+            if policy_head is not None and w_policy > 0.0:
+                # Behavior-cloning target: the block-ending (last raw-frame)
+                # executed action id per action block -- matches how
+                # `action_hist` conditions subsequent blocks in the planner
+                # (see `planner._score_action_sequences`'s use of
+                # `sub_actions[:, t, -1:]`).
+                raw_actions = torch.from_numpy(batch["action"].astype(np.int64)).to(device)
+                b_sz = raw_actions.shape[0]
+                steps = transition_len
+                block_actions = raw_actions[:, : steps * stride].reshape(b_sz, steps, stride)
+                policy_targets = block_actions[:, :, -1]
+            return pixels, a_oh, rewards, dones, state_vec, policy_targets
 
         @torch.no_grad()
         def evaluate() -> dict[str, float]:
@@ -724,22 +782,24 @@ def train(
             losses_r_im: list[float] = []
             losses_c_im: list[float] = []
             losses_probe: list[float] = []
+            losses_policy: list[float] = []
             n_batches = max(1, val_starts.size // batch_size)
             val_batches = int(cfg.get("val_batches", 0) or 0)
             if val_batches > 0:
                 n_batches = min(n_batches, val_batches)
             val_rng = np.random.default_rng(12345)
             for _ in range(n_batches):
-                pixels, a_oh, rewards, dones, state_vec = _make_batch(
+                pixels, a_oh, rewards, dones, state_vec, policy_targets = _make_batch(
                     val_starts, val_terminal_starts, val_rng
                 )
-                out = _step_forward(pixels, a_oh, rewards, dones, state_vec)
+                out = _step_forward(pixels, a_oh, rewards, dones, state_vec, policy_targets)
                 losses_r.append(out["loss_r"].item())
                 losses_c.append(out["loss_c"].item())
                 losses_v.append(out["loss_v"].item())
                 losses_r_im.append(out["loss_r_im"].item())
                 losses_c_im.append(out["loss_c_im"].item())
                 losses_probe.append(out["loss_probe"].item())
+                losses_policy.append(out["loss_policy"].item())
             head_modules.train()
             return {
                 "val_loss_r": float(np.mean(losses_r)),
@@ -748,6 +808,7 @@ def train(
                 "val_loss_r_im": float(np.mean(losses_r_im)),
                 "val_loss_c_im": float(np.mean(losses_c_im)),
                 "val_loss_probe": float(np.mean(losses_probe)),
+                "val_loss_policy": float(np.mean(losses_policy)),
             }
 
         def _save_ckpt(
@@ -783,6 +844,7 @@ def train(
                     "value_target_head": value_target_heads[0].state_dict(),
                     "value_target_heads": [h.state_dict() for h in value_target_heads],
                     "probe": probe.state_dict(),
+                    "policy_head": (policy_head.state_dict() if policy_head is not None else None),
                     "optim": optim.state_dict(),
                     "config": jepa["_arch"],
                     "heads_config": hcfg,
@@ -807,12 +869,12 @@ def train(
         t0 = time.time()
         head_modules.train()
         for step in range(start_step, num_steps):
-            pixels, a_oh, rewards, dones, state_vec = _make_batch(
+            pixels, a_oh, rewards, dones, state_vec, policy_targets = _make_batch(
                 train_starts, train_terminal_starts, rng
             )
 
             with amp_autocast(device):
-                out = _step_forward(pixels, a_oh, rewards, dones, state_vec)
+                out = _step_forward(pixels, a_oh, rewards, dones, state_vec, policy_targets)
                 loss = out["loss"]
 
             optim.zero_grad(set_to_none=True)
@@ -831,6 +893,7 @@ def train(
                 "loss_r_im": float(out["loss_r_im"].item()),
                 "loss_c_im": float(out["loss_c_im"].item()),
                 "loss_probe": float(out["loss_probe"].item()),
+                "loss_policy": float(out["loss_policy"].item()),
                 "z_norm": float(out["z_norm"].item()),
                 "grad_norm": float(grad_norm.item()),
             }
@@ -840,7 +903,7 @@ def train(
                     f"[train_lewm_heads] step={step:5d} train "
                     f"r={metrics['loss_r']:.4f} c={metrics['loss_c']:.4f} v={metrics['loss_v']:.4f} "
                     f"r_im={metrics['loss_r_im']:.4f} c_im={metrics['loss_c_im']:.4f} "
-                    f"probe={metrics['loss_probe']:.4f} "
+                    f"probe={metrics['loss_probe']:.4f} policy={metrics['loss_policy']:.4f} "
                     f"|z|={metrics['z_norm']:.2f} grad={metrics['grad_norm']:.2f}"
                 )
 

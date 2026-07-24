@@ -110,6 +110,73 @@ def parse_args() -> argparse.Namespace:
                         "(only has an effect if the checkpoint's heads were "
                         "trained with reward_ensemble_size/value_ensemble_size > 1). "
                         "0.0 (default) = plain mean, no pessimism.")
+    p.add_argument("--planner-elite-temp", type=float, default=None,
+                   help="CEM only (#1 MPPI-style soft update): temperature for "
+                        "a Boltzmann-weighted elite refit (softmax(score/temp) "
+                        "over the top-k elites) instead of a hard 0/1 count. "
+                        "More sample-efficient at low --planner-samples. "
+                        "0.0 (default) = original hard top-k count.")
+    p.add_argument("--planner-value-weight", type=float, default=None,
+                   help="CEM only (#2): scalar weight on the terminal value "
+                        "head contribution to the score (per-step reward keeps "
+                        "weight 1.0). <1 leans on reward over the noisier value "
+                        "head. 1.0 (default) = original behavior.")
+    p.add_argument("--planner-reward-clip", type=float, default=None,
+                   help="CEM only (#2): winsorize each imagined frame's reward "
+                        "to [-C, C] so CEM cannot chase one hallucinated big "
+                        "hit. 0.0 (default) = no clipping.")
+    p.add_argument("--planner-idle-penalty", type=float, default=None,
+                   help="CEM only (#3): subtract this much score for every "
+                        "planned frame whose action is a deliberate no-op "
+                        "(NEUTRAL by default; see --planner-idle-actions). "
+                        "Fixes the observed 'agent stands idle for long "
+                        "stretches' failure mode caused by a flat/noisy "
+                        "reward-value landscape giving CEM nothing to push "
+                        "it away from the safe no-op. 0.0 (default) = "
+                        "disabled, original behavior.")
+    p.add_argument("--planner-idle-actions", nargs="+", default=None,
+                   help="Action enum names to treat as 'idle' for "
+                        "--planner-idle-penalty (default: NEUTRAL).")
+    p.add_argument("--planner-repeat-penalty", type=float, default=None,
+                   help="CEM only: subtract this much score for every "
+                        "planned raw frame whose action repeats the "
+                        "immediately-preceding one (including across the "
+                        "decision boundary, via the last actually-executed "
+                        "action). Counterweights sticky_prob/warm-start "
+                        "locking onto one action (e.g. one guard/dash) for "
+                        "long stretches. 0.0 (default) = disabled, original "
+                        "behavior.")
+    p.add_argument("--planner-no-policy-prior", action="store_true", default=None,
+                   help="CEM only (#4): disable the behavior-cloned "
+                        "policy-prior warm start (see policy_head.py) even if "
+                        "the loaded checkpoint has one -- falls back to the "
+                        "original uniform-init CEM behavior. Only meaningful "
+                        "for checkpoints trained with heads.policy_loss_weight "
+                        "> 0 (e.g. lewm_heads_checkpoint_stride5_m5_policy.pt); "
+                        "a no-op otherwise.")
+    p.add_argument("--opponent-model", action="store_true", default=None,
+                   help="LeWM only. Enable the RHEAPI-style online opponent "
+                        "model: a live-trained threat predictor that biases the "
+                        "planner's first action toward guard/evasion when a hit "
+                        "is imminent and toward offense when it's safe. Learns "
+                        "from observed HP deltas each decision; no retrain, no "
+                        "pixels. See agents/lewm/online_opponent_model.py and "
+                        "docs/lewm_planner_literature_research_2026-07-22.md.")
+    p.add_argument("--opponent-model-strength", type=float, default=None,
+                   help="Scales how hard the online threat estimate biases the "
+                        "first-action distribution (default 1.5). 0 = off.")
+    p.add_argument("--opp-action-head", default=None,
+                   help="LeWM only. Path to a trained OppActionHead checkpoint "
+                        "(see scripts/train_opp_action_head.py) -- a BC classifier "
+                        "predicting the opponent's next action from real recorded "
+                        "Dreamer-opponent data (obs/opp/action), unlike "
+                        "--opponent-model's online-fit geometric proxy. When set, "
+                        "loads the head and enables its first-action bias overlay "
+                        "(use --opp-action-strength to tune/disable).")
+    p.add_argument("--opp-action-strength", type=float, default=None,
+                   help="Scales how hard the OppActionHead's predicted-attack "
+                        "probability biases the first-action distribution "
+                        "(default 1.5). 0 = off (loaded but inert).")
     p.add_argument("--planner-chunk-size", type=int, default=None,
                    help="Only re-run the full CEM search once every N "
                         "decisions; the other N-1 decisions reuse actions "
@@ -194,8 +261,22 @@ def main() -> None:
             else not args.planner_allow_state_actions
         ),
         uncertainty_penalty=args.planner_uncertainty_penalty,
+        use_opponent_model=args.opponent_model,
+        opponent_model_strength=args.opponent_model_strength,
+        use_opp_action_model=(None if args.opp_action_head is None else True),
+        opp_action_model_strength=args.opp_action_strength,
         chunk_size=args.planner_chunk_size,
         plan_raw_actions=args.planner_plan_raw_actions,
+        elite_temp=args.planner_elite_temp,
+        value_weight=args.planner_value_weight,
+        reward_clip=args.planner_reward_clip,
+        idle_penalty=args.planner_idle_penalty,
+        idle_action_names=args.planner_idle_actions,
+        repeat_penalty=args.planner_repeat_penalty,
+        use_policy_prior=(
+            None if args.planner_no_policy_prior is None
+            else not args.planner_no_policy_prior
+        ),
         num_simulations=args.planner_num_simulations,
         max_depth=args.planner_max_depth,
         c_puct=args.planner_c_puct,
@@ -204,9 +285,13 @@ def main() -> None:
         virtual_loss=args.planner_virtual_loss,
     )
     p1_agent = build_agent(args.p1, args.p1_ckpt, args.device,
-                            planner=args.p1_planner, **shared_planner_kwargs)
+                            planner=args.p1_planner,
+                            opp_action_head_ckpt=args.opp_action_head,
+                            **shared_planner_kwargs)
     p2_agent = build_agent(args.p2, args.p2_ckpt, args.device,
-                            planner=args.p2_planner, **shared_planner_kwargs)
+                            planner=args.p2_planner,
+                            opp_action_head_ckpt=args.opp_action_head,
+                            **shared_planner_kwargs)
     if hasattr(p1_agent, "warmup"):
         p1_agent.warmup()
     if hasattr(p2_agent, "warmup"):

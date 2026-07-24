@@ -63,7 +63,8 @@ class RandomAgent:
         return self._rng.randrange(self._n)
 
 
-def build_agent(name: str, ckpt: str | None, device: str, planner: str | None = None, **planner_kwargs):
+def build_agent(name: str, ckpt: str | None, device: str, planner: str | None = None,
+                 opp_action_head_ckpt: str | None = None, **planner_kwargs):
     name = name.lower()
     if name == "random":
         return RandomAgent()
@@ -80,6 +81,8 @@ def build_agent(name: str, ckpt: str | None, device: str, planner: str | None = 
         agent = LewmAgent(device=device)
         if ckpt:
             agent.load(ckpt)
+        if opp_action_head_ckpt:
+            agent.load_opp_action_head(opp_action_head_ckpt)
         if planner is not None or any(v is not None for v in planner_kwargs.values()):
             agent.configure_planner(name=planner, **planner_kwargs)
         agent.warmup()

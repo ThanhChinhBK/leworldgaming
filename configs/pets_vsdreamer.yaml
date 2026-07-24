@@ -1,0 +1,37 @@
+# PETS — final model trained on the fresh real-vs-DreamerV3 dataset
+# (/media/jeovach/Hoctap/leword-opponent, 267,812 transitions, 117 episodes,
+# real opponent-action labels + pixels). Architecture/hyperparams identical
+# to configs/pets.yaml; only data_path/ckpt_path changed.
+
+# Architecture
+state_dim: 26          # = PETS_STATE_DIM (2 * 11 primitives + 4 globals)
+action_dim: 56
+ensemble_size: 5
+hidden: 200
+num_layers: 3
+action_emb_dim: 16
+max_hp: 400.0
+
+# Optimization
+batch_size: 256
+lr: 1.0e-3
+weight_decay: 1.0e-5
+grad_clip: 1.0
+
+# Inference-time CEM planner (used by PETSAgent.act, not by training loop)
+planner_horizon: 15
+planner_num_candidates: 200
+planner_num_elites: 20
+planner_num_iters: 4
+planner_gamma: 0.99
+planner_sample_dynamics: true
+
+# Data + I/O
+data_path: /media/jeovach/Hoctap/leword-opponent
+ckpt_path: data/pets_checkpoint_vsdreamer.pt
+log_every: 50
+val_split: 0.1
+val_every: 250
+val_batches: 8
+ckpt_every: 2000
+seed: 0
