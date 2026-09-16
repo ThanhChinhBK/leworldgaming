@@ -21,6 +21,7 @@ ckpt_every: 1000      # save a checkpoint every N steps (0 = only at end)
 seed: 0
 
 # Behaviour modifiers
+restrict_to_playable_actions: true  # false reproduces historical unrestricted inference
 compile: false        # torch.compile is flaky on MPS; flip on for CUDA boxes
 precision: 32         # 16 enables AMP — set to 16 on CUDA only
 device: null          # null → auto (CUDA → MPS → CPU)

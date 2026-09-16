@@ -32,50 +32,13 @@ from leworldgaming.agents.lewm.projector import Projector
 from leworldgaming.agents.lewm.reward_head import RewardHead
 from leworldgaming.agents.lewm.twohot import make_bins
 from leworldgaming.agents.lewm.value_head import ValueHead
+from leworldgaming.env.action_space import commandable_action_ids
 
 
 def _commandable_action_ids(num_actions: int) -> torch.Tensor | None:
-    """Indices of ``[0, num_actions)`` that ``CommandCenter.action_to_command``
-    actually maps to a key combo, plus ``NEUTRAL`` (a deliberate no-op).
-
-    FightingICE's raw ``pyftg.Action`` enum (56 values matching the default
-    ``action_dim``) also contains ~16 "state observation" values —
-    ``STAND``/``AIR``/``*_GUARD_RECOV``/``*_RECOV``/``CHANGE_DOWN``/``DOWN``/
-    ``RISE``/``LANDING``/``THROW_HIT``/``THROW_SUFFER`` — that describe what
-    the character is currently doing, not a command a player can issue.
-    ``RecordingAI`` only ever records the actually-requested (playable)
-    action as training-data labels (see ``env/recording_ai.py``), so these
-    ~16 indices' rows in ``ActionEncoder`` are essentially never trained —
-    their embeddings are close to random init.
-
-    If the (frozen, Stage-A-trained) planner ever samples one of these as
-    "best", ``CommandCenter.command_call`` silently falls through every
-    ``elif`` branch, ``skill_key`` stays empty, and the frame gets a blank
-    ``Key()`` — i.e. this decision window does *nothing*, no matter what the
-    game state was. Under one-shot ``random_shooting`` this happens on
-    ~28% of samples; even under CEM, once one of these low-signal actions
-    gets an inflated score from noise it can dominate a whole elite set.
-    This is a likely major contributor to LeWM looking like it "wanders"
-    instead of committing to a coherent, aggressive plan.
-
-    Returns ``None`` (no restriction — falls back to uniform-over-everything,
-    matching old behavior) if ``num_actions`` doesn't match the real 56-way
-    FightingICE action space, since the mapping below is only valid for it.
-    """
-    if num_actions != 56:
-        return None
-    try:
-        from pyftg.models.enums.action import Action
-
-        from leworldgaming.env.policies import PLAYABLE_ACTIONS
-    except Exception:  # pragma: no cover - pyftg optional in some test envs
-        return None
-    playable_names = {a.name for a in PLAYABLE_ACTIONS}
-    ids = [
-        i for i in range(num_actions)
-        if Action.from_int(i).name == "NEUTRAL" or Action.from_int(i).name in playable_names
-    ]
-    return torch.tensor(ids, dtype=torch.long)
+    """Tensor adapter for the shared static commandability contract."""
+    ids = commandable_action_ids(num_actions)
+    return None if ids is None else torch.tensor(ids, dtype=torch.long)
 
 
 def _resolve_idle_action_ids(names: list[str]) -> torch.Tensor | None:
@@ -478,12 +441,32 @@ class LewmAgent(AgentBase):
 
     @torch.no_grad()
     def act(self, obs: dict[str, Any]) -> int:
+        """Plan at the trained stride, or every raw frame in raw-action CEM mode.
+
+        Raw mode retains complete executed action blocks and subsamples the
+        observation history at ``temporal_stride`` spacing for the predictor.
+        The caller must use ``frame_skip=1`` in that mode.
+        """
         x = obs["pixels"].to(self.device)
         z = self.projector(self.encoder(x.unsqueeze(0))).squeeze(0)
-        z_context = torch.stack([*self._z_history, z], dim=0)
-        past_actions = torch.as_tensor(
-            self._action_history, dtype=torch.long, device=self.device
-        )
+        raw_mode = self.planner_name == "cem" and self.planner_plan_raw_actions
+        if raw_mode:
+            stride = self.temporal_stride
+            context = [
+                self._z_history[-offset]
+                for offset in reversed(range(stride, len(self._z_history) + 1, stride))
+            ]
+            n_raw = len(context) * stride
+            past_actions = torch.as_tensor(
+                self._action_history[-n_raw:] if n_raw else [],
+                dtype=torch.long, device=self.device,
+            ).reshape(-1, stride)
+        else:
+            context = self._z_history
+            past_actions = torch.as_tensor(
+                self._action_history, dtype=torch.long, device=self.device
+            )
+        z_context = torch.stack([*context, z], dim=0)
         use_reward = self.heads_loaded and float(
             self.heads_cfg.get("reward_loss_weight", 0.0)
         ) > 0.0
@@ -557,7 +540,7 @@ class LewmAgent(AgentBase):
                     momentum=self.planner_momentum,
                     min_prob=self.planner_min_prob,
                     init_dist=self._plan_dist,
-                    warm_shift=max(self._chunk_consumed, 1),
+                    warm_shift=self._chunk_consumed + 1,
                     plan_raw_actions=self.planner_plan_raw_actions,
                     elite_temp=self.planner_elite_temp,
                     value_weight=self.planner_value_weight,
@@ -641,6 +624,8 @@ class LewmAgent(AgentBase):
         self._action_history.append(action)
         self._last_executed_action = int(action)
         keep = max(self.history_size - 1, 0)
+        if raw_mode:
+            keep *= self.temporal_stride
         if keep:
             self._z_history = self._z_history[-keep:]
             self._action_history = self._action_history[-keep:]
@@ -706,6 +691,7 @@ class LewmAgent(AgentBase):
         ``planner.cem_shooting``), and ``"mcts"`` (discrete MCTS/PUCT, see
         ``mcts_planner.mcts_search``) per run without retraining anything.
         """
+        was_raw = self.planner_name == "cem" and self.planner_plan_raw_actions
         if name is not None:
             if name not in ("random", "cem", "mcts"):
                 raise ValueError(f"Unknown planner: {name!r}. Choose: random, cem, mcts.")
@@ -782,6 +768,8 @@ class LewmAgent(AgentBase):
         self._plan_dist = None
         self._chunk_queue = []
         self._chunk_consumed = 0
+        if was_raw != (self.planner_name == "cem" and self.planner_plan_raw_actions):
+            self.reset_episode()
 
     @torch.no_grad()
     def warmup(self, n_iters: int = 2) -> None:
@@ -819,6 +807,12 @@ class LewmAgent(AgentBase):
             "heads_config": self.heads_cfg,
             "config": self.model_cfg,
         }
+        for name, head in (("reward", self.reward_head), ("value", self.value_head)):
+            if isinstance(head, nn.ModuleList):
+                save_dict[f"{name}_heads"] = [member.state_dict() for member in head]
+                save_dict[f"{name}_head"] = head[0].state_dict()
+        if self.policy_head is not None:
+            save_dict["policy_head"] = self.policy_head.state_dict()
         torch.save(save_dict, path)
 
     @staticmethod
@@ -828,11 +822,8 @@ class LewmAgent(AgentBase):
         ``train_lewm_heads.py`` checkpoints (ensemble-aware, 2026-07-20+)
         save both: ``plural_key`` (a list of per-member state dicts) and
         ``singular_key`` (member 0 only, for older non-ensemble-aware
-        consumers). ``LewmAgent.save()`` and pre-ensembling checkpoints only
-        have ``singular_key``. Prefers the plural key when both ``head`` is
-        an ensemble and the checkpoint has it; otherwise falls back to the
-        singular key loaded into ``head`` directly (single module) or its
-        first member (ensemble of size 1).
+        consumers). Also accepts older ``LewmAgent.save()`` checkpoints
+        containing a ModuleList state dict under the singular key.
         """
         if isinstance(head, nn.ModuleList):
             if plural_key in ckpt:
@@ -847,6 +838,10 @@ class LewmAgent(AgentBase):
                     member.load_state_dict(state)
             elif len(head) == 1 and singular_key in ckpt:
                 head[0].load_state_dict(ckpt[singular_key])
+            elif singular_key in ckpt and any(
+                key.startswith("0.") for key in ckpt[singular_key]
+            ):
+                head.load_state_dict(ckpt[singular_key])
             else:
                 raise KeyError(
                     f"Checkpoint has neither {plural_key!r} nor a compatible {singular_key!r}."
@@ -899,7 +894,9 @@ class LewmAgent(AgentBase):
             self.continuation_head.load_state_dict(ckpt["continuation_head"])
             self._load_head(self.value_head, ckpt, "value_heads", "value_head")
             self.heads_loaded = True
-            if self.policy_head is not None and ckpt.get("policy_head") is not None:
+            if self.policy_head is not None:
+                if ckpt.get("policy_head") is None:
+                    raise ValueError("Checkpoint enables a policy head but has no policy_head weights.")
                 self.policy_head.load_state_dict(ckpt["policy_head"])
         else:
             warnings.warn(

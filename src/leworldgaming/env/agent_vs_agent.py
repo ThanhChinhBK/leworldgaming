@@ -16,7 +16,6 @@ etc.) via ``scripts/self_play.py``.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -39,6 +38,14 @@ from pyftg.socket.utils.asyncio import recv_data, send_data
 
 from leworldgaming.data.replay_buffer import ReplayBuffer
 from leworldgaming.env.fightingice_env import _to_pixel_tensor
+from leworldgaming.env.match_contracts import (
+    PixelReader,
+    close_writer,
+    positive_integer,
+    round_hps,
+    run_controllers,
+    validate_obs_mode,
+)
 from leworldgaming.env.spectator_recorder import SpectatorRecorder
 from leworldgaming.env.state_vector import frame_to_obs_dict
 from leworldgaming.utils.timing import FRAME_BUDGET_MS, FrameBudget
@@ -104,6 +111,7 @@ class _SelfDrivingAI(AIInterface):
         self._obs_mode = obs_mode
         self._image_size = image_size
         self._pixel_source = pixel_source
+        self._pixels = PixelReader(pixel_source)
         self._outcomes = outcomes
         self._max_hp = max_hp
         self._max_energy = max_energy
@@ -178,7 +186,7 @@ class _SelfDrivingAI(AIInterface):
             max_hp=self._max_hp, max_energy=self._max_energy,
         )
         if self._obs_mode == "pixel":
-            px = self._pixel_source.latest_pixels() if self._pixel_source else None
+            px = self._pixels.read()
             obs["pixels"] = _to_pixel_tensor(px, self._image_size)
         return obs
 
@@ -187,8 +195,8 @@ class _SelfDrivingAI(AIInterface):
         warning once the streak crosses ``_STUCK_WARN_FRAMES`` — this is the
         "bot has no action at all" symptom the user reported. Logging the
         *reason* (rather than just the symptom) lets us tell apart: waiting
-        on frame data, a missing character (round transition), an agent
-        exception, or the planner genuinely choosing to hold still.
+        on frame data, a missing character (round transition), or the
+        planner genuinely choosing to hold still.
         """
         if reason == self._last_noop_reason:
             self._noop_streak += 1
@@ -245,15 +253,11 @@ class _SelfDrivingAI(AIInterface):
                 with self._latency:
                     action_int = self._agent.act(obs)
             except Exception:
-                # Never let an agent bug (bad tensor shape, NaNs, OOM, ...)
-                # silently degrade to "no input forever" — log the full
-                # traceback once per occurrence and fall back to NEUTRAL so
-                # the match keeps going and the cause is still discoverable.
                 logger.exception(
-                    "[%s] agent.act() raised at frame %d; falling back to NEUTRAL",
+                    "[%s] agent.act() raised at frame %d; aborting match",
                     self._name, frame_no,
                 )
-                action_int = 0  # IntAction.NEUTRAL == 0; Action.NEUTRAL.value is a str name
+                raise
             self._pending_action = Action.from_int(int(action_int))
             logger.debug(
                 "[%s] frame %d: action=%s (id=%d)",
@@ -335,17 +339,13 @@ class _SelfDrivingAI(AIInterface):
         self._skip_ctr = 0
         # Only P1's AI records each round's outcome (avoids double-counting).
         if self._player_number:
-            rem = getattr(round_result, "remaining_hps", None)
-            hp_p1 = hp_p2 = None
-            winner: str | None = None
-            if rem and len(rem) >= 2:
-                hp_p1, hp_p2 = float(rem[0]), float(rem[1])
-                if hp_p1 > hp_p2:
-                    winner = "P1"
-                elif hp_p2 > hp_p1:
-                    winner = "P2"
-                else:
-                    winner = "draw"
+            hp_p1, hp_p2 = round_hps(round_result)
+            if hp_p1 > hp_p2:
+                winner = "P1"
+            elif hp_p2 > hp_p1:
+                winner = "P2"
+            else:
+                winner = "draw"
             self._round_index += 1
             self._outcomes.append(RoundOutcome(self._round_index, hp_p1, hp_p2, winner))
 
@@ -396,6 +396,16 @@ async def _run_match_async(
     record_buffer: ReplayBuffer | None = None,
     record_pixels: bool = False,
 ) -> MatchResult:
+    positive_integer("games", games)
+    positive_integer("image_size", image_size)
+    positive_integer("p1_frame_skip", p1_frame_skip)
+    positive_integer("p2_frame_skip", p2_frame_skip)
+    validate_obs_mode(p1_obs_mode)
+    validate_obs_mode(p2_obs_mode)
+    if not all(isinstance(name, str) and name.strip() for name in (p1_name, p2_name)):
+        raise ValueError("Player names must be nonempty strings")
+    if p1_name == p2_name:
+        raise ValueError("Player names must be unique")
     outcomes: list[RoundOutcome] = []
     needs_pixels = p1_obs_mode == "pixel" or p2_obs_mode == "pixel" or record_pixels
     spectator = SpectatorRecorder(image_size=image_size) if needs_pixels else None
@@ -412,44 +422,36 @@ async def _run_match_async(
     gateway.register_ai(p1_name, ai_p1)
     gateway.register_ai(p2_name, ai_p2)
 
-    reader, writer = await asyncio.open_connection(host, port)
-    request = service_pb2.RunGameRequest(
-        character_1=character, character_2=character,
-        player_1=p1_name, player_2=p2_name,
-        game_number=games,
-    )
-    await send_data(writer, b"\x02", with_header=False)
-    await send_data(writer, request.SerializeToString())
-    response_packet = await recv_data(reader)
-    response = service_pb2.RunGameResponse()
-    response.ParseFromString(response_packet)
-    if response.status_code is StatusCode.FAILED:
-        raise RuntimeError(f"JVM refused game: {response.response_message}")
-    logger.info("game accepted: P1=%s P2=%s", p1_name, p2_name)
-
-    ai_tasks = [
-        asyncio.create_task(AIController(host, port, ai_p1, True).run()),
-        asyncio.create_task(AIController(host, port, ai_p2, False).run()),
-    ]
-    spectator_task: asyncio.Task | None = None
-    if spectator is not None:
-        sctrl = StreamController(host, port, spectator, keep_alive=False)
-        spectator_task = asyncio.create_task(sctrl.run())
-
+    writer = None
     try:
-        await asyncio.wait(ai_tasks, return_when=asyncio.ALL_COMPLETED)
-        for task in ai_tasks:
-            exc = task.exception()
-            if exc is not None:
-                logger.error("AI task failed: %r", exc)
+        reader, writer = await asyncio.open_connection(host, port)
+        request = service_pb2.RunGameRequest(
+            character_1=character, character_2=character,
+            player_1=p1_name, player_2=p2_name,
+            game_number=games,
+        )
+        await send_data(writer, b"\x02", with_header=False)
+        await send_data(writer, request.SerializeToString())
+        response_packet = await recv_data(reader)
+        response = service_pb2.RunGameResponse()
+        response.ParseFromString(response_packet)
+        if response.status_code == StatusCode.FAILED.value:
+            raise RuntimeError(f"JVM refused game: {response.response_message}")
+        logger.info("game accepted: P1=%s P2=%s", p1_name, p2_name)
+
+        controllers = [
+            AIController(host, port, ai_p1, True),
+            AIController(host, port, ai_p2, False),
+        ]
+        sctrl = (
+            StreamController(host, port, spectator, keep_alive=False)
+            if spectator is not None else None
+        )
+        await run_controllers(controllers, sctrl)
+        if not outcomes or any(r.winner not in ("P1", "P2", "draw") for r in outcomes):
+            raise RuntimeError("Match completed without valid round outcomes")
     finally:
-        with contextlib.suppress(Exception):
-            writer.close()
-            await writer.wait_closed()
-        if spectator_task is not None and not spectator_task.done():
-            spectator_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await spectator_task
+        await close_writer(writer)
         if spectator is not None:
             spectator.close()
         await gateway.close()
@@ -465,5 +467,9 @@ def run_match(
     p2_agent: ActingAgent,
     **kwargs: Any,
 ) -> MatchResult:
-    """Blocking entry point — runs a full agent-vs-agent match and returns results."""
+    """Run a match, raising on agent/socket failures or missing round outcomes.
+
+    Pixel agents wait up to two seconds for the first spectator image rather
+    than silently acting on a fabricated black image.
+    """
     return asyncio.run(_run_match_async(p1_agent, p2_agent, **kwargs))

@@ -1,4 +1,4 @@
-.PHONY: sync demo fmt lint game game-watch game-pixels game-stop fetch-native game-native game-native-linux game-play clean
+.PHONY: sync demo fmt lint test game game-watch game-pixels game-stop fetch-native game-native game-native-linux game-play clean
 
 sync:
 	uv sync --extra dev
@@ -11,6 +11,9 @@ fmt:
 
 lint:
 	uv run ruff check src/ scripts/
+
+test:
+	uv run python -m unittest discover -s tests -v
 
 game:
 	docker compose -f docker/fightingice/docker-compose.yml up -d

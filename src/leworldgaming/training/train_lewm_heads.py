@@ -847,6 +847,7 @@ def train(
                     "policy_head": (policy_head.state_dict() if policy_head is not None else None),
                     "optim": optim.state_dict(),
                     "config": jepa["_arch"],
+                    "training_config": cfg,
                     "heads_config": hcfg,
                     "stage": "B",
                     "num_steps": step_done,

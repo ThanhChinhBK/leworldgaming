@@ -18,7 +18,6 @@ import torch
 
 from leworldgaming.agents.base import AgentBase
 from leworldgaming.agents.pets.cem_planner import CEMPlannerDiscrete
-from leworldgaming.agents.pets.cost import analytic_reward
 from leworldgaming.agents.pets.dynamics import EnsembleDynamics
 from leworldgaming.env.action_space import NUM_ACTIONS
 from leworldgaming.env.state_vector import (
@@ -42,6 +41,7 @@ class PETSAgent(AgentBase):
         self.state_dim = int(cfg.get("state_dim", PETS_STATE_DIM))
         self.action_dim = int(cfg.get("action_dim", NUM_ACTIONS))
         self.max_hp = float(cfg.get("max_hp", 400.0))
+        self.restrict_to_playable_actions = bool(cfg.get("restrict_to_playable_actions", True))
 
         self.dynamics = EnsembleDynamics(
             state_dim=self.state_dim,
@@ -62,6 +62,7 @@ class PETSAgent(AgentBase):
             sample_dynamics=bool(cfg.get("planner_sample_dynamics", True)),
             device=self.device,
             max_hp=self.max_hp,
+            restrict_to_playable_actions=self.restrict_to_playable_actions,
         )
 
     def act(self, obs: dict[str, Any]) -> int:
@@ -77,6 +78,7 @@ class PETSAgent(AgentBase):
             s_np = obs_dict_to_pets_vector(obs)
         s = torch.from_numpy(s_np).to(self.device, dtype=torch.float32)
         self.dynamics.eval()
+        self.planner.restrict_to_playable_actions = self.restrict_to_playable_actions
         budget = obs.get("_frame_budget")
         if budget is None:
             budget = FrameBudget()
@@ -110,10 +112,11 @@ class PETSAgent(AgentBase):
         return torch.as_tensor(x, device=self.device, dtype=dtype)
 
     def save(self, path: str) -> None:
+        config = {**self.cfg, "restrict_to_playable_actions": self.restrict_to_playable_actions}
         torch.save(
             {
                 "dynamics": self.dynamics.state_dict(),
-                "config": self.cfg,
+                "config": config,
             },
             path,
         )

@@ -36,12 +36,16 @@ from __future__ import annotations
 
 import argparse
 import logging
+from dataclasses import asdict
+from pathlib import Path
 
 # Reuse the single-agent script's checkpoint-loading logic instead of
 # duplicating it.
-from play import build_agent  # noqa: E402  (sys.path shim below)
+from play import build_agent, frame_skip_for
 
 from leworldgaming.env.agent_vs_agent import run_match
+from leworldgaming.eval.results import checkpoint_identity, code_identity, write_result
+from leworldgaming.utils.seed import set_seed
 
 
 def _obs_mode_for(agent_name: str) -> str:
@@ -49,11 +53,7 @@ def _obs_mode_for(agent_name: str) -> str:
 
 
 def _frame_skip_for(agent_name: str, agent, override: int | None) -> int:
-    if override is not None:
-        return override
-    if agent_name.lower() == "lewm":
-        return int(agent.temporal_stride)
-    return 1
+    return frame_skip_for(agent_name, agent, override)
 
 
 def parse_args() -> argparse.Namespace:
@@ -225,6 +225,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=31415)
     p.add_argument("--device", default="cpu", help="cpu | mps | cuda (used for both agents)")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Seed Python/NumPy/Torch; does not seed JVM internals or guarantee "
+                        "deterministic ordering of concurrent GPU inference.")
+    p.add_argument("--pace", default="sync", choices=["sync", "realtime"],
+                   help="sync: JVM waits for each 60 Hz decision (model/control quality). "
+                        "realtime: JVM advances without waiting (deadline feasibility). "
+                        "Set the matching EVAL_PACE when using scripts/run_eval.sh.")
+    p.add_argument("--output", type=Path, default=None,
+                   help="Write a JSON result; refuses to overwrite an existing result.")
+    p.add_argument("--allow-legacy-dreamer", action="store_true",
+                   help="Permit a legacy/unknown action-alignment Dreamer checkpoint for exploratory runs.")
+    p.add_argument("--allow-unvalidated-lewm-p2", action="store_true",
+                   help="Permit experimental P2 inference using a P1-only pixel model.")
     p.add_argument("--debug", action="store_true",
                    help="Enable per-decision DEBUG logs from agent_vs_agent "
                         "(frame number + chosen action per agent). Also logs "
@@ -243,6 +256,14 @@ def main() -> None:
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.output is not None and args.output.exists():
+        raise SystemExit(f"Result already exists: {args.output}")
+    if args.p2.lower() == "lewm":
+        message = "LeWM pixel training was P1-only; P2 inference is not validated or canonicalized."
+        if not args.allow_unvalidated_lewm_p2:
+            raise ValueError(message + " Use --allow-unvalidated-lewm-p2 only for exploratory runs.")
+        logging.warning(message)
+    set_seed(args.seed)
 
     shared_planner_kwargs = dict(
         horizon=args.planner_horizon,
@@ -285,10 +306,14 @@ def main() -> None:
         virtual_loss=args.planner_virtual_loss,
     )
     p1_agent = build_agent(args.p1, args.p1_ckpt, args.device,
+                            seed=args.seed,
+                            allow_legacy_dreamer=args.allow_legacy_dreamer,
                             planner=args.p1_planner,
                             opp_action_head_ckpt=args.opp_action_head,
                             **shared_planner_kwargs)
     p2_agent = build_agent(args.p2, args.p2_ckpt, args.device,
+                            seed=args.seed + 1,
+                            allow_legacy_dreamer=args.allow_legacy_dreamer,
                             planner=args.p2_planner,
                             opp_action_head_ckpt=args.opp_action_head,
                             **shared_planner_kwargs)
@@ -297,15 +322,42 @@ def main() -> None:
     if hasattr(p2_agent, "warmup"):
         p2_agent.warmup()
 
+    p1_frame_skip = _frame_skip_for(args.p1, p1_agent, args.p1_frame_skip)
+    p2_frame_skip = _frame_skip_for(args.p2, p2_agent, args.p2_frame_skip)
     result = run_match(
         p1_agent, p2_agent,
         p1_name=f"P1_{args.p1.upper()}", p2_name=f"P2_{args.p2.upper()}",
         p1_obs_mode=_obs_mode_for(args.p1), p2_obs_mode=_obs_mode_for(args.p2),
-        p1_frame_skip=_frame_skip_for(args.p1, p1_agent, args.p1_frame_skip),
-        p2_frame_skip=_frame_skip_for(args.p2, p2_agent, args.p2_frame_skip),
+        p1_frame_skip=p1_frame_skip,
+        p2_frame_skip=p2_frame_skip,
         host=args.host, port=args.port, character=args.character,
         games=args.games, image_size=args.image_size,
     )
+    if args.output is not None:
+        import torch
+
+        root = Path(__file__).resolve().parents[1]
+        source_exclude = args.output.parent if args.output.parent.resolve() != root else None
+        write_result(args.output, {
+            "schema_version": 1,
+            "evaluation": "head_to_head",
+            "pace": args.pace,
+            "latency_note": (
+                "Budget overruns are informational because the JVM waits."
+                if args.pace == "sync" else
+                "JVM was launched without input-sync; latency reflects 60 Hz deadline feasibility."
+            ),
+            "seed_note": "Python/NumPy/Torch only; JVM and concurrent scheduling are not deterministic.",
+            "arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+            "frame_skip": {"P1": p1_frame_skip, "P2": p2_frame_skip},
+            "checkpoints": {
+                side: checkpoint_identity(path) if path else None
+                for side, path in (("P1", args.p1_ckpt), ("P2", args.p2_ckpt))
+            },
+            "code": code_identity(root, exclude=source_exclude),
+            "runtime": {"torch": torch.__version__, "device": args.device},
+            "result": asdict(result),
+        })
 
     logging.info("=" * 60)
     logging.info("P1=%s (%s)  vs  P2=%s (%s)", args.p1, args.p1_ckpt, args.p2, args.p2_ckpt)

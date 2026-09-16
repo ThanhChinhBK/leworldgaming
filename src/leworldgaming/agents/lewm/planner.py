@@ -94,6 +94,7 @@ def _prepare_context(
     history_size: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad context; past actions may be scalar decisions or complete raw blocks."""
     hs = history_size
     if z_context.ndim == 1:
         z_context = z_context.unsqueeze(0)
@@ -105,17 +106,19 @@ def _prepare_context(
     z_hist = z_context.unsqueeze(0).expand(num_samples, -1, -1).contiguous()
 
     if hs == 1:
-        past_actions = torch.empty(0, dtype=torch.long, device=device)
+        block_shape = () if past_actions is None else past_actions.shape[1:]
+        past_actions = torch.empty((0, *block_shape), dtype=torch.long, device=device)
     elif past_actions is None:
         past_actions = torch.zeros(hs - 1, dtype=torch.long, device=device)
     else:
         past_actions = past_actions.to(device=device, dtype=torch.long)[-(hs - 1) :]
-        if past_actions.numel() < hs - 1:
+        if past_actions.shape[0] < hs - 1:
             pad = torch.zeros(
-                hs - 1 - past_actions.numel(), dtype=torch.long, device=device
+                (hs - 1 - past_actions.shape[0], *past_actions.shape[1:]),
+                dtype=torch.long, device=device,
             )
             past_actions = torch.cat([pad, past_actions])
-    action_hist = past_actions.unsqueeze(0).expand(num_samples, -1).contiguous()
+    action_hist = past_actions.unsqueeze(0).expand(num_samples, *past_actions.shape).contiguous()
     return z_hist, action_hist
 
 
@@ -153,10 +156,9 @@ def _score_action_sequences(
     ``sub_actions``: optional ``(S, H, temporal_stride)`` tensor of
     genuinely-distinct per-raw-frame action ids for each planned block (see
     ``_concat_action_blocks``). When given, ``actions`` is ignored for
-    building the *current* block's embedding (only already-committed history
-    still uses the repeated-block encoding, since past decisions really were
-    a single action held for the whole block); the block-ending action is
-    still folded into ``action_hist`` for conditioning subsequent blocks.
+    building block embeddings. Historical actions may be complete raw blocks
+    ``(S, HS-1, temporal_stride)`` or repeated high-level actions ``(S, HS-1)``.
+    Complete blocks are retained while advancing imagined history.
 
     ``repeat_penalty``: subtract a fixed cost, per planned raw frame, for
     every frame whose action equals the *immediately preceding* raw frame's
@@ -178,6 +180,8 @@ def _score_action_sequences(
     if sub_actions is not None:
         s = sub_actions.shape[0]
         horizon = sub_actions.shape[1]
+        if action_hist.ndim == 2:
+            action_hist = action_hist.unsqueeze(-1).expand(-1, -1, temporal_stride)
     else:
         s = actions.shape[0]
         horizon = actions.shape[1]
@@ -191,18 +195,8 @@ def _score_action_sequences(
 
     for t in range(horizon):
         if sub_actions is not None:
-            if action_hist.shape[1] > 0:
-                hist_blocks = _repeat_action_blocks(
-                    action_hist, num_actions, temporal_stride
-                )
-            else:
-                hist_blocks = torch.zeros(
-                    s, 0, temporal_stride * num_actions, device=device
-                )
-            cur_block = _concat_action_blocks(
-                sub_actions[:, t], num_actions
-            ).unsqueeze(1)
-            action_blocks = torch.cat([hist_blocks, cur_block], dim=1)
+            action_window = torch.cat([action_hist, sub_actions[:, t : t + 1]], dim=1)
+            action_blocks = _concat_action_blocks(action_window, num_actions)
         else:
             action_window = torch.cat([action_hist, actions[:, t : t + 1]], dim=1)
             action_blocks = _repeat_action_blocks(
@@ -236,10 +230,7 @@ def _score_action_sequences(
                     is_repeat = (cur_raw == lead).float().mean(dim=-1)
                     scores.sub_(discount * repeat_penalty * is_repeat)
             else:
-                if t == 0:
-                    prev_a = _prev_raw_action
-                else:
-                    prev_a = actions[:, t - 1]
+                prev_a = _prev_raw_action if t == 0 else actions[:, t - 1]
                 if prev_a is not None:
                     is_repeat = (actions[:, t] == prev_a).float()
                     scores.sub_(discount * repeat_penalty * is_repeat)
@@ -264,12 +255,7 @@ def _score_action_sequences(
         else:
             discount.mul_(gamma)
         z_hist = torch.cat([z_hist[:, 1:], z_next.unsqueeze(1)], dim=1)
-        if sub_actions is not None:
-            action_hist = torch.cat(
-                [action_hist[:, 1:], sub_actions[:, t, -1:]], dim=1
-            )
-        else:
-            action_hist = action_window[:, 1:]
+        action_hist = action_window[:, 1:]
 
     final_z = z_hist[:, -1]  # (S, D)
     if value_head is not None and value_bins is not None:
@@ -523,10 +509,7 @@ def cem_shooting(
             mask[valid_actions] = 1.0
             init_row = init_row * mask
         total = init_row.sum()
-        if total > 0:
-            init_row = init_row / total
-        else:
-            init_row = uniform_row
+        init_row = init_row / total if total > 0 else uniform_row
 
     if init_dist is None:
         dist = init_row.unsqueeze(0).expand(plan_len, -1).contiguous()

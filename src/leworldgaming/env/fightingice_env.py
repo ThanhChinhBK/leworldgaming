@@ -51,6 +51,14 @@ from pyftg.socket.aio.gateway import Gateway
 from pyftg.socket.aio.stream_controller import StreamController
 from pyftg.socket.utils.asyncio import recv_data, send_data
 
+from leworldgaming.env.match_contracts import (
+    PixelReader,
+    close_writer,
+    positive_integer,
+    round_hps,
+    run_controllers,
+    validate_obs_mode,
+)
 from leworldgaming.env.policies import make_policy
 from leworldgaming.env.recording_ai import RecordingAI
 from leworldgaming.env.spectator_recorder import SpectatorRecorder
@@ -79,15 +87,28 @@ class EnvConfig:
     max_hp: float = 400.0
     max_energy: float = 300.0
 
+    def __post_init__(self) -> None:
+        positive_integer("games", self.games)
+        positive_integer("frame_skip", self.frame_skip)
+        positive_integer("image_size", self.image_size)
+        validate_obs_mode(self.obs_mode)
+        if not isinstance(self.agent_player, str) or self.agent_player.upper() not in ("P1", "P2"):
+            raise ValueError("agent_player must be 'P1' or 'P2'")
+        if not isinstance(self.opponent, str) or not self.opponent.strip():
+            raise ValueError("opponent must be a nonempty AI name")
+        if self.opponent == "LWG_AGENT":
+            raise ValueError("opponent name must differ from LWG_AGENT")
+
 
 def _to_pixel_tensor(px: np.ndarray | None, image_size: int):
     """uint8 framebuffer -> the same ImageNet normalization used for training."""
+    if px is None:
+        raise RuntimeError("No decoded spectator pixels available")
     import torch
 
     from leworldgaming.utils.image import normalize_imagenet_pixels
 
-    arr = np.zeros((3, image_size, image_size), dtype=np.uint8) if px is None else px
-    return normalize_imagenet_pixels(torch.from_numpy(np.ascontiguousarray(arr)))
+    return normalize_imagenet_pixels(torch.from_numpy(np.ascontiguousarray(px)))
 
 
 class _BridgeAI(AIInterface):
@@ -112,6 +133,7 @@ class _BridgeAI(AIInterface):
         self._obs_mode = obs_mode
         self._image_size = image_size
         self._pixel_source = pixel_source
+        self._pixels = PixelReader(pixel_source)
         self._max_hp = max_hp
         self._max_energy = max_energy
         self._frame_skip = max(1, int(frame_skip))
@@ -126,6 +148,8 @@ class _BridgeAI(AIInterface):
         self._skip_ctr = 0  # counts down to the next decision frame
         self._pending_action: Action | None = None
         self._last_obs: dict[str, Any] | None = None
+        self.completed_rounds = 0
+        self._stopped = threading.Event()
 
     def name(self) -> str:
         return self._name
@@ -162,11 +186,14 @@ class _BridgeAI(AIInterface):
             max_hp=self._max_hp, max_energy=self._max_energy,
         )
         if self._obs_mode == "pixel":
-            px = self._pixel_source.latest_pixels() if self._pixel_source else None
+            px = self._pixels.read()
             obs["pixels"] = _to_pixel_tensor(px, self._image_size)
         return obs
 
     def processing(self) -> None:
+        if self._stopped.is_set():
+            self._key = Key()
+            return
         fd = self._frame_data
         if fd.empty_flag or fd.current_frame_number < 0:
             self._key = Key()
@@ -224,19 +251,19 @@ class _BridgeAI(AIInterface):
         # No processing() fires for the terminal frame; synthesize the
         # terminal transition so the pending env.step() returns done=True.
         reward = 0.0
-        rem = getattr(round_result, "remaining_hps", None)
-        if rem and self._prev_hp_self is not None and len(rem) >= 2:
+        rem = round_hps(round_result)
+        self.completed_rounds += 1
+        if self._prev_hp_self is not None:
             idx = 0 if self._player_number else 1
             hp_self, hp_opp = float(rem[idx]), float(rem[1 - idx])
             damage_dealt = self._prev_hp_opp - hp_opp
             damage_taken = self._prev_hp_self - hp_self
             reward = float(damage_dealt - damage_taken) / max(self._max_hp, 1.0)
         info: dict[str, Any] = {"terminal": True}
-        if rem and len(rem) >= 2:
-            idx = 0 if self._player_number else 1
-            info["hp_self"] = float(rem[idx])
-            info["hp_opp"] = float(rem[1 - idx])
-            info["win"] = float(rem[idx]) > float(rem[1 - idx])
+        idx = 0 if self._player_number else 1
+        info["hp_self"] = float(rem[idx])
+        info["hp_opp"] = float(rem[1 - idx])
+        info["win"] = float(rem[idx]) > float(rem[1 - idx])
         self._obs_q.put(("round_end", self._last_obs, reward, True, info))
         self._prev_hp_self = None
         self._prev_hp_opp = None
@@ -249,7 +276,10 @@ class _BridgeAI(AIInterface):
         self._obs_q.put(("game_end", None, 0.0, True, {"game_end": True}))
 
     def close(self) -> None:
-        self._obs_q.put(("close", None, 0.0, True, {"match_over": True}))
+        # Only the match coordinator can declare success, after checking all
+        # controllers. An individual socket may close while another fails.
+        self._stopped.set()
+        self._act_q.put(None)
 
 
 class FightingIceEnv:
@@ -259,10 +289,15 @@ class FightingIceEnv:
     directly by ``PETSAgent`` / vector-mode Dreamer). In ``obs_mode="pixel"``
     it also carries ``obs["pixels"]`` — a float32 ``(3,H,W)`` tensor in
     ``[-1, 1]`` for ``LewmAgent``.
+
+    ``reset`` and ``step`` raise on match failures (including absent pixels
+    after a bounded two-second first-frame wait), rather than reporting a
+    successful terminal transition.
     """
 
     def __init__(self, cfg: EnvConfig | None = None) -> None:
         self.cfg = cfg or EnvConfig()
+        self.cfg.__post_init__()
         self._obs_q: queue.Queue = queue.Queue()
         self._act_q: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
@@ -271,6 +306,10 @@ class FightingIceEnv:
         self.match_over = False
         self._bridge: _BridgeAI | None = None
         self._spectator: SpectatorRecorder | None = None
+        self._error: Exception | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._match_task: asyncio.Task | None = None
+        self._closing = threading.Event()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -284,11 +323,22 @@ class FightingIceEnv:
     def _thread_main(self) -> None:
         try:
             asyncio.run(self._match_main())
+        except asyncio.CancelledError:
+            if self._closing.is_set():
+                self._obs_q.put(("close", None, 0.0, True, {"match_over": True}))
+            else:
+                self._error = RuntimeError("Match cancelled unexpectedly")
+                self._obs_q.put(("error", None, 0.0, True, {"error": self._error}))
         except Exception as exc:  # surface to the waiting reset()/step()
             logger.exception("match thread crashed")
-            self._obs_q.put(("error", None, 0.0, True, {"error": repr(exc)}))
+            self._error = exc
+            self._obs_q.put(("error", None, 0.0, True, {"error": exc}))
 
     async def _match_main(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._match_task = asyncio.current_task()
+        if self._closing.is_set():
+            raise asyncio.CancelledError
         cfg = self.cfg
         agent_is_p1 = cfg.agent_player.upper() == "P1"
         opp_is_jvm = cfg.opponent.lower() not in _PYTHON_POLICIES
@@ -321,47 +371,42 @@ class FightingIceEnv:
         agent_names = ["LWG_AGENT", opp_name] if agent_is_p1 else [opp_name, "LWG_AGENT"]
 
         # --- request the game on a control connection ---
-        reader, writer = await asyncio.open_connection(cfg.host, cfg.port)
-        request = service_pb2.RunGameRequest(
-            character_1=cfg.character, character_2=cfg.character,
-            player_1=agent_names[0], player_2=agent_names[1],
-            game_number=cfg.games,
-        )
-        await send_data(writer, b"\x02", with_header=False)
-        await send_data(writer, request.SerializeToString())
-        response_packet = await recv_data(reader)
-        response = service_pb2.RunGameResponse()
-        response.ParseFromString(response_packet)
-        if response.status_code is StatusCode.FAILED:
-            raise RuntimeError(f"JVM refused game: {response.response_message}")
-        logger.info("game accepted: P1=%s P2=%s", agent_names[0], agent_names[1])
-
-        # --- start AI controllers (one per python AI) ---
-        ai_tasks: list[asyncio.Task] = []
-        for i, name in enumerate(agent_names):
-            agent = gateway.registered_agents.get(name)
-            if agent is not None:  # None => JVM AI, driven server-side
-                ctrl = AIController(cfg.host, cfg.port, agent, i == 0)
-                ai_tasks.append(asyncio.create_task(ctrl.run()))
-
-        spectator_task: asyncio.Task | None = None
-        if self._spectator is not None:
-            sctrl = StreamController(cfg.host, cfg.port, self._spectator, keep_alive=False)
-            spectator_task = asyncio.create_task(sctrl.run())
-
+        writer = None
         try:
-            await asyncio.wait(ai_tasks, return_when=asyncio.ALL_COMPLETED)
+            reader, writer = await asyncio.open_connection(cfg.host, cfg.port)
+            request = service_pb2.RunGameRequest(
+                character_1=cfg.character, character_2=cfg.character,
+                player_1=agent_names[0], player_2=agent_names[1],
+                game_number=cfg.games,
+            )
+            await send_data(writer, b"\x02", with_header=False)
+            await send_data(writer, request.SerializeToString())
+            response_packet = await recv_data(reader)
+            response = service_pb2.RunGameResponse()
+            response.ParseFromString(response_packet)
+            if response.status_code == StatusCode.FAILED.value:
+                raise RuntimeError(f"JVM refused game: {response.response_message}")
+            logger.info("game accepted: P1=%s P2=%s", agent_names[0], agent_names[1])
+
+            controllers = []
+            for i, name in enumerate(agent_names):
+                agent = gateway.registered_agents.get(name)
+                if agent is not None:
+                    controllers.append(AIController(cfg.host, cfg.port, agent, i == 0))
+            sctrl = (
+                StreamController(cfg.host, cfg.port, self._spectator, keep_alive=False)
+                if self._spectator is not None else None
+            )
+            await run_controllers(controllers, sctrl)
+            if not self._bridge.completed_rounds:
+                raise RuntimeError("Match completed without valid round outcomes")
         finally:
-            with contextlib.suppress(Exception):
-                writer.close()
-                await writer.wait_closed()
-            if spectator_task is not None and not spectator_task.done():
-                spectator_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await spectator_task
+            self._bridge.close()
+            await close_writer(writer)
             if self._spectator is not None:
                 self._spectator.close()
             await gateway.close()
+        self._obs_q.put(("close", None, 0.0, True, {"match_over": True}))
 
     # -- Gym-style API -----------------------------------------------------
 
@@ -371,6 +416,7 @@ class FightingIceEnv:
         Returns ``(obs, info)``. When the whole match is over returns
         ``(None, {"match_over": True})`` — the caller should stop looping.
         """
+        self._raise_if_failed()
         if not self._started:
             self._start_match()
         if self.match_over:
@@ -379,10 +425,11 @@ class FightingIceEnv:
         # Skip any pending terminal markers; wait for the next live frame.
         while True:
             kind, obs, _, _, info = self._obs_q.get()
+            self._raise_if_failed(info if kind == "error" else None)
             if kind == "step":
                 self._done = False
                 return obs, info
-            if kind in ("close", "error"):
+            if kind == "close":
                 self.match_over = True
                 return None, info
             # 'game_end' between games is followed by the next round's 'step';
@@ -390,23 +437,40 @@ class FightingIceEnv:
 
     def step(self, action: int) -> tuple[dict[str, Any] | None, float, bool, bool, dict[str, Any]]:
         """Apply ``action`` (int in ``[0, NUM_ACTIONS)``) for one frame."""
+        self._raise_if_failed()
         if self._done:
             raise RuntimeError("step() after episode end — call reset() first")
         self._act_q.put(int(action))
         kind, obs, reward, _, info = self._obs_q.get()
+        self._raise_if_failed(info if kind == "error" else None)
         if kind == "step":
             return obs, reward, False, False, info
         if kind == "round_end":
             self._done = True
             return obs, reward, True, False, info  # obs = last live frame
-        # game_end / close / error arriving here ends the episode + match.
+        # game_end / close arriving here ends the episode + match.
         self._done = True
         self.match_over = True
         return None, reward, True, False, info
 
+    def _raise_if_failed(self, info: dict[str, Any] | None = None) -> None:
+        if info is not None:
+            error = info.get("error", "Unknown match failure")
+            self._error = error if isinstance(error, Exception) else RuntimeError(str(error))
+        if self._error is not None:
+            self._done = True
+            self.match_over = True
+            raise RuntimeError(f"FightingICE match failed: {self._error}") from self._error
+
     def close(self) -> None:
+        self._closing.set()
+        if self._bridge is not None:
+            self._bridge.close()
         # Unblock a parked processing() so the match thread can wind down.
         with contextlib.suppress(Exception):
             self._act_q.put(None)
+        if self._loop is not None and self._match_task is not None:
+            with contextlib.suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(self._match_task.cancel)
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=2.0)

@@ -29,6 +29,7 @@ log_every: 10
 seed: 0
 
 # Behaviour modifiers
+restrict_to_playable_actions: true  # false reproduces historical unrestricted inference
 compile: false        # flip on for a CUDA box to speed up training
 precision: 16         # AMP — halves VRAM on CUDA; set to 32 on CPU/MPS
 device: null          # null → auto (CUDA → MPS → CPU)

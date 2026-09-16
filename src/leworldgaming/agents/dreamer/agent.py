@@ -10,6 +10,7 @@ plan at ``docs/gemini_research.md`` §7.1.
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ import numpy as np
 import torch
 
 from leworldgaming.agents.base import AgentBase
-from leworldgaming.env.action_space import NUM_ACTIONS
+from leworldgaming.env.action_space import NUM_ACTIONS, mask_action_logits
 from leworldgaming.env.state_vector import obs_dict_to_dreamer_vector
 
 
@@ -98,6 +99,12 @@ class DreamerAgent(AgentBase):
         self._dreamer = dreamer_module
         self._config = config
         self.device = device
+        self.restrict_to_playable_actions = bool(
+            config.get("restrict_to_playable_actions", True)
+            if isinstance(config, dict)
+            else getattr(config, "restrict_to_playable_actions", True)
+        )
+        self.action_alignment: str | None = None
         # Recurrent (latent, prev_action) state carried across act() calls
         # within one episode/round — mirrors the ``state`` tuple threaded
         # through the upstream ``Dreamer.__call__``/``_policy``. Reset at the
@@ -115,6 +122,12 @@ class DreamerAgent(AgentBase):
         """
         self._state = None
         self._episode_started = True
+
+    @staticmethod
+    def _mask_actor_distribution(module, inputs, distribution):
+        # Mask before upstream actor.mode(), so its recurrent previous action
+        # is also the commandable action actually returned to the environment.
+        return type(distribution)(logits=mask_action_logits(distribution.logits))
 
     def act(self, obs: dict[str, Any]) -> int:
         """Greedy action from the actor given the current observation.
@@ -139,7 +152,11 @@ class DreamerAgent(AgentBase):
             "is_terminal": np.array([False]),
         }
         self._episode_started = False
-        with torch.no_grad():
+        mask_context = (
+            self._dreamer._task_behavior.actor.register_forward_hook(self._mask_actor_distribution)
+            if self.restrict_to_playable_actions else nullcontext()
+        )
+        with torch.no_grad(), mask_context:
             policy_output, self._state = self._dreamer(
                 batch, np.array([False]), self._state, training=False
             )
@@ -150,9 +167,10 @@ class DreamerAgent(AgentBase):
         """One world-model + imagined-behavior gradient step."""
         post, context, metrics = self._dreamer._wm._train(batch)
         # Train the actor/critic on imagined rollouts from learned dynamics.
-        reward_fn = lambda f, s, a: self._dreamer._wm.heads["reward"](
-            self._dreamer._wm.dynamics.get_feat(s)
-        ).mode()
+        def reward_fn(f, s, a):
+            return self._dreamer._wm.heads["reward"](
+                self._dreamer._wm.dynamics.get_feat(s)
+            ).mode()
         beh_metrics = self._dreamer._task_behavior._train(post, reward_fn)[-1]
         merged: dict[str, float] = {}
         for k, v in metrics.items():
@@ -168,10 +186,13 @@ class DreamerAgent(AgentBase):
         return merged
 
     def save(self, path: str) -> None:
+        config = dict(vars(self._config)) if hasattr(self._config, "__dict__") else dict(self._config)
+        config["restrict_to_playable_actions"] = self.restrict_to_playable_actions
         torch.save(
             {
                 "agent_state_dict": self._dreamer.state_dict(),
-                "config": vars(self._config) if hasattr(self._config, "__dict__") else dict(self._config),
+                "config": config,
+                "action_alignment": self.action_alignment,
             },
             path,
         )
@@ -179,3 +200,10 @@ class DreamerAgent(AgentBase):
     def load(self, path: str) -> None:
         ckpt = torch.load(path, map_location=self.device)
         self._dreamer.load_state_dict(ckpt["agent_state_dict"])
+        self.action_alignment = ckpt.get("action_alignment")
+        self.restrict_to_playable_actions = bool(
+            ckpt.get("config", {}).get(
+                "restrict_to_playable_actions", self.restrict_to_playable_actions
+            )
+        )
+        self.reset_episode()

@@ -49,6 +49,8 @@ from typing import Any
 
 from leworldgaming.env.action_space import NUM_ACTIONS
 from leworldgaming.env.fightingice_env import EnvConfig, FightingIceEnv
+from leworldgaming.env.policies import PLAYABLE_ACTIONS
+from leworldgaming.utils.seed import set_seed
 from leworldgaming.utils.timing import FRAME_BUDGET_MS, FrameBudget
 
 
@@ -56,18 +58,24 @@ class RandomAgent:
     """Model-free baseline so the env loop is exercisable without a checkpoint."""
 
     def __init__(self, num_actions: int = NUM_ACTIONS, seed: int = 0) -> None:
-        self._n = num_actions
+        self._actions = [action.to_int() for action in PLAYABLE_ACTIONS
+                         if action.to_int() < num_actions]
+        if not self._actions:
+            raise ValueError("num_actions excludes every playable action.")
         self._rng = random.Random(seed)
 
     def act(self, obs: dict[str, Any]) -> int:
-        return self._rng.randrange(self._n)
+        return self._rng.choice(self._actions)
 
 
 def build_agent(name: str, ckpt: str | None, device: str, planner: str | None = None,
-                 opp_action_head_ckpt: str | None = None, **planner_kwargs):
+                 opp_action_head_ckpt: str | None = None, seed: int = 0,
+                 allow_legacy_dreamer: bool = False, **planner_kwargs):
     name = name.lower()
     if name == "random":
-        return RandomAgent()
+        return RandomAgent(seed=seed)
+    if name in {"pets", "lewm", "dreamer"} and not ckpt:
+        raise ValueError(f"--agent {name} requires a trained --ckpt.")
     if name == "pets":
         from leworldgaming.agents.pets.agent import PETSAgent
 
@@ -92,8 +100,37 @@ def build_agent(name: str, ckpt: str | None, device: str, planner: str | None = 
 
         if not ckpt:
             raise SystemExit("--agent dreamer requires --ckpt (a saved dreamer checkpoint).")
-        return build_agent_for_inference(ckpt, device=device)
+        agent = build_agent_for_inference(ckpt, device=device)
+        if getattr(agent, "action_alignment", None) != "incoming_action_v1":
+            message = (
+                "Dreamer checkpoint has legacy/unknown action alignment. Historical exports "
+                "used outgoing actions where the RSSM expects incoming actions; corrected "
+                "training is required for a faithful benchmark."
+            )
+            if not allow_legacy_dreamer:
+                raise ValueError(message + " Use --allow-legacy-dreamer only for labeled legacy runs.")
+            logging.warning(message)
+        return agent
     raise SystemExit(f"Unknown agent: {name!r}. Choose: random, pets, lewm, dreamer.")
+
+
+def frame_skip_for(name: str, agent: Any, override: int | None) -> int:
+    """Match execution cadence to the model's trained timestep."""
+    if name.lower() == "random":
+        if override is not None and override < 1:
+            raise ValueError("frame_skip must be positive.")
+        return 1 if override is None else override
+    expected = int(agent.temporal_stride) if name.lower() == "lewm" else 1
+    if name.lower() == "lewm" and agent.planner_plan_raw_actions:
+        if agent.planner_name != "cem":
+            raise ValueError("Raw-action LeWM requires the CEM planner.")
+        expected = 1
+    if override is not None and override != expected:
+        raise ValueError(
+            f"{name} requires frame_skip={expected} for its model/planner timestep, "
+            f"not {override}. Cadence ablations are not faithful checkpoint evaluation."
+        )
+    return expected
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,6 +156,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=31415)
     p.add_argument("--device", default="cpu", help="cpu | mps | cuda")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--allow-legacy-dreamer", action="store_true",
+                   help="Explicitly allow a legacy/unknown action-alignment checkpoint; "
+                        "results are not a corrected Dreamer baseline.")
+    p.add_argument("--allow-unvalidated-lewm-p2", action="store_true",
+                   help="Allow experimental P2 use of a P1-only pixel model; no canonicalization is applied.")
     p.add_argument("--planner", default=None, choices=[None, "random", "cem"],
                    help="LeWM only. 'random': one-shot random shooting (the original "
                         "JEPA-planning paper's baseline). 'cem': iCEM-style iterative "
@@ -169,10 +211,15 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = parse_args()
+    if args.agent.lower() == "lewm" and args.player == "P2" and not args.allow_unvalidated_lewm_p2:
+        raise ValueError("LeWM pixels were trained P1-only; P2 requires --allow-unvalidated-lewm-p2.")
+    set_seed(args.seed)
 
     obs_mode = args.obs_mode
     if obs_mode == "auto":
         obs_mode = "pixel" if args.agent.lower() == "lewm" else "state"
+    if args.agent.lower() == "lewm" and obs_mode != "pixel":
+        raise ValueError("LeWM requires pixel observations.")
 
     restrict_to_playable_actions = (
         None if args.planner_allow_state_actions is None
@@ -184,6 +231,8 @@ def main() -> None:
     )
     agent = build_agent(
         args.agent, args.ckpt, args.device,
+        seed=args.seed,
+        allow_legacy_dreamer=args.allow_legacy_dreamer,
         planner=args.planner,
         horizon=args.planner_horizon,
         num_samples=args.planner_samples,
@@ -195,17 +244,7 @@ def main() -> None:
         use_value_head=use_value_head,
         restrict_to_playable_actions=restrict_to_playable_actions,
     )
-    if args.agent.lower() == "lewm":
-        expected_stride = int(agent.temporal_stride)
-        if args.frame_skip is None:
-            args.frame_skip = expected_stride
-        elif args.frame_skip != expected_stride:
-            raise SystemExit(
-                f"LeWM checkpoint was trained with temporal_stride={expected_stride}, "
-                f"but --frame-skip={args.frame_skip}. These must match."
-            )
-    elif args.frame_skip is None:
-        args.frame_skip = 1
+    args.frame_skip = frame_skip_for(args.agent, agent, args.frame_skip)
 
     env = FightingIceEnv(EnvConfig(
         host=args.host, port=args.port, character=args.character,

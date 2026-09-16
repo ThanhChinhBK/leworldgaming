@@ -19,6 +19,7 @@ weight_decay: 1.0e-5
 grad_clip: 1.0
 
 # Inference-time CEM planner (used by PETSAgent.act, not by training loop)
+restrict_to_playable_actions: true  # false reproduces historical unrestricted inference
 planner_horizon: 15
 planner_num_candidates: 200
 planner_num_elites: 20

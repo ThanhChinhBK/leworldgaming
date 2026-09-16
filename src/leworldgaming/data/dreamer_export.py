@@ -48,13 +48,13 @@ from leworldgaming.env.state_vector import (
     canonicalize_sample,
 )
 
-# Bumped when the on-disk npz layout changes — old caches get rebuilt instead
-# of silently feeding stale shapes into the trainer. One marker per obs mode so
-# vector and image caches never clobber each other.
+# Bumped when the on-disk contract changes. Incompatible caches require a
+# fresh directory (or explicit overwrite), never silent reuse.
 _EXPORT_SCHEMA = {
-    "vector": "vector_v1",
-    "image": "image_v1",
+    "vector": "vector_v2",
+    "image": "image_v2",
 }
+ACTION_ALIGNMENT = "incoming_action_v1"
 
 # Default edge length for the CNN-mode image. DreamerV3's ConvEncoder needs a
 # power-of-two side (stages = log2(size) - log2(minres=4)); 64 → 4 stages,
@@ -98,7 +98,9 @@ def _read_episode_arrays(f: h5py.File, a: int, b: int) -> dict[str, np.ndarray]:
     for group_path, schema in _BUFFER_GROUPS.items():
         side_key = group_path.split("/")[-1]
         for name in schema:
-            out[f"{side_key}/{name}"] = f[f"{group_path}/{name}"][a:b]
+            key = f"{group_path}/{name}"
+            if key in f:
+                out[f"{side_key}/{name}"] = f[key][a:b]
     return out
 
 
@@ -164,6 +166,42 @@ def _stride_terminal_flags(
     return out
 
 
+def _aligned_episode(
+    actions: np.ndarray,
+    rewards: np.ndarray,
+    dones: np.ndarray,
+    action_dim: int,
+    stride: int,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Pair each observation with its incoming action and incoming reward.
+
+    Strided exports retain the final observation, including a partial block.
+    Their categorical action represents the action at the preceding block
+    start; unlike LeWM's concatenated actions, this is an action-repeat
+    abstraction and cannot represent arbitrary within-block action changes.
+    """
+    if stride < 1:
+        raise ValueError("stride must be >= 1")
+    length = len(actions)
+    if length < 2 or len(rewards) != length or len(dones) != length:
+        raise ValueError("episode arrays must have equal length >= 2")
+    picks = np.unique(np.append(np.arange(0, length, stride), length - 1))
+    incoming = np.zeros((len(picks), action_dim), dtype=np.float32)
+    incoming[np.arange(1, len(picks)), actions[picks[:-1]].astype(np.int64)] = 1.0
+    reward_out = np.empty(len(picks), dtype=np.float32)
+    reward_out[0] = rewards[0]
+    for i in range(1, len(picks)):
+        reward_out[i] = rewards[picks[i - 1] + 1 : picks[i] + 1].sum()
+    first = np.zeros(len(picks), dtype=bool)
+    first[0] = True
+    return picks, {
+        "action": incoming,
+        "reward": reward_out,
+        "is_first": first,
+        "is_terminal": dones[picks].astype(bool),
+    }
+
+
 def export_episodes_to_npz(
     data_path: str | Path,
     out_dir: str | Path,
@@ -186,21 +224,23 @@ def export_episodes_to_npz(
     (matching LeWM's ``temporal_stride`` convention — see
     ``configs/lewm.yaml`` and ``_stride_block_starts`` above), so a Dreamer
     trained this way can be compared to LeWM at the same decision rate.
-    ``stride=1`` (default) is the original unstrided/backward-compatible
-    behavior — byte-identical to before this parameter was added. Reward is
-    summed (not just kept at the block-start frame) over each block's
-    shifted window via ``_stride_reduce_reward`` so total episode reward is
-    conserved regardless of stride.
+    Actions are shifted to the incoming-action RSSM contract at every stride;
+    the initial action is an all-zero dummy. Rewards at stride 1 are unchanged.
+    Larger strides aggregate incoming rewards and retain the final observation.
 
     Cache invalidation: writes a small ``_EXPORT_SCHEMA`` marker (stride is
     folded into the marker string so caches at different strides never mix).
-    If the marker is missing or stale and ``out_dir`` already has npz files,
-    re-export. Otherwise skip silently.
+    Legacy/incompatible caches are refused by default, not silently reused or
+    deleted. Choose a fresh output directory, or explicitly request overwrite.
     """
     if obs_mode not in _EXPORT_SCHEMA:
         raise ValueError(f"obs_mode must be one of {sorted(_EXPORT_SCHEMA)}, got {obs_mode!r}")
-    stride = int(stride) or 1
-    schema = f"{_EXPORT_SCHEMA[obs_mode]}_stride{stride}"
+    stride = int(stride)
+    if stride < 1:
+        raise ValueError("stride must be >= 1")
+    schema = f"{_EXPORT_SCHEMA[obs_mode]}_{ACTION_ALIGNMENT}_stride{stride}"
+    if obs_mode == "image":
+        schema += f"_size{image_size}"
 
     h5_paths = _resolve_h5_paths(data_path)
     out_dir = Path(out_dir)
@@ -216,9 +256,12 @@ def export_episodes_to_npz(
               f"(schema={schema}) — skip")
         return existing
 
-    if has_episodes and existing_marker != schema:
-        print(f"[dreamer_export] cache schema mismatch "
-              f"('{existing_marker}' != '{schema}') — clearing {out_dir}")
+    if has_episodes and not overwrite:
+        raise ValueError(
+            f"Incompatible Dreamer cache at {out_dir}: {existing_marker!r} != "
+            f"{schema!r}. Preserve it and choose a fresh episode_dir."
+        )
+    if has_episodes and overwrite:
         for p in out_dir.glob("*.npz"):
             p.unlink()
 
@@ -242,7 +285,6 @@ def export_episodes_to_npz(
 
             action_arr = f["action"][:]
             reward_arr = f["reward"][:]
-            is_first_arr = f["is_first"][:].astype(bool)
             done_arr = f["done"][:].astype(bool)
 
             for _, (a, b) in enumerate(slices):
@@ -250,40 +292,10 @@ def export_episodes_to_npz(
                 if length < 2:
                     continue
 
-                if stride == 1:
-                    actions_int = action_arr[a:b].astype(np.int64)
-                    out_len = length
-                    is_first = is_first_arr[a:b].copy()
-                    is_first[0] = True
-                    is_terminal = done_arr[a:b].copy()
-                    is_terminal[-1] = True
-                    reward_out = reward_arr[a:b].astype(np.float32)
-                    pick_idx = np.arange(length)
-                else:
-                    starts = _stride_block_starts(length, stride)
-                    if len(starts) == 0:
-                        continue
-                    out_len = len(starts)
-                    pick_idx = starts
-                    actions_int = action_arr[a:b][starts].astype(np.int64)
-                    is_first = np.zeros(out_len, dtype=bool)
-                    is_first[0] = True
-                    is_terminal = _stride_terminal_flags(
-                        done_arr[a:b], starts, stride, length
-                    )
-                    reward_out = _stride_reduce_reward(
-                        reward_arr[a:b], starts, stride, length
-                    )
-
-                action_oh = np.zeros((out_len, action_dim), dtype=np.float32)
-                action_oh[np.arange(out_len), actions_int] = 1.0
-
-                ep = {
-                    "action": action_oh,
-                    "reward": reward_out,
-                    "is_first": is_first,
-                    "is_terminal": is_terminal,
-                }
+                pick_idx, ep = _aligned_episode(
+                    action_arr[a:b], reward_arr[a:b], done_arr[a:b], action_dim, stride
+                )
+                out_len = len(pick_idx)
 
                 if obs_mode == "image":
                     px = f["pixels"][a:b][pick_idx]  # (out_len, C, H, W) uint8

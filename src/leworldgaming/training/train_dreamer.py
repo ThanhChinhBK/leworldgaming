@@ -30,7 +30,7 @@ from leworldgaming.agents.dreamer.agent import (
     make_action_space,
     make_obs_space,
 )
-from leworldgaming.data.dreamer_export import export_episodes_to_npz
+from leworldgaming.data.dreamer_export import ACTION_ALIGNMENT, export_episodes_to_npz
 from leworldgaming.env.action_space import NUM_ACTIONS
 from leworldgaming.env.state_vector import DREAMER_STATE_DIM
 from leworldgaming.utils.device import best_device
@@ -70,6 +70,7 @@ DEFAULTS: dict[str, Any] = {
     "precision": 32,   # 16 enables AMP; CPU/MPS prefer 32
     "device": None,    # auto-pick via best_device() if unset
     "actor_dist": "onehot",  # discrete-action default
+    "restrict_to_playable_actions": True,
 }
 
 
@@ -136,6 +137,9 @@ def _build_dreamer_config(cfg: dict[str, Any], device: torch.device) -> Namespac
     merged["precision"] = int(cfg["precision"])
     merged["seed"] = int(cfg["seed"])
     merged["num_actions"] = int(cfg["num_actions"])
+    merged["restrict_to_playable_actions"] = bool(
+        cfg.get("restrict_to_playable_actions", True)
+    )
     merged["log_every"] = int(cfg["log_every"]) * 1000  # upstream's tools.Every is divisor-based
     merged["video_pred_log"] = False
     merged["expl_until"] = 0
@@ -171,6 +175,15 @@ def _patch_upstream_mlp_device(dreamer_networks: Any, device: torch.device) -> N
 
     dreamer_networks.MLP.__init__ = _patched_mlp_init
     dreamer_networks.MLP._lwg_patched = True
+
+
+def _require_action_alignment(checkpoint: dict[str, Any]) -> None:
+    if checkpoint.get("action_alignment") != ACTION_ALIGNMENT:
+        raise ValueError(
+            "Cannot resume a legacy/misaligned Dreamer checkpoint as aligned "
+            "training. Preserve it; use a new checkpoint and episode directory "
+            "for training from scratch."
+        )
 
 
 def build_agent_for_inference(
@@ -217,7 +230,9 @@ def build_agent_for_inference(
     agent_module.load_state_dict(ckpt["agent_state_dict"])
     agent_module.eval()
 
-    return DreamerAgent(agent_module, dreamer_cfg, resolved_device)
+    agent = DreamerAgent(agent_module, dreamer_cfg, resolved_device)
+    agent.action_alignment = ckpt.get("action_alignment")
+    return agent
 
 
 def train(
@@ -234,6 +249,12 @@ def train(
       4. Save the agent state_dict + config.
     """
     cfg = _load_config(config_path, overrides)
+    if bool(cfg.get("resume", False)) and Path(cfg["ckpt_path"]).exists():
+        metadata = torch.load(
+            cfg["ckpt_path"], map_location="cpu", weights_only=False, mmap=True
+        )
+        _require_action_alignment(metadata)
+        del metadata
     set_seed(int(cfg["seed"]))
     device = torch.device(cfg["device"]) if cfg["device"] else best_device()
     state_dim = int(cfg["state_dim"])
@@ -336,6 +357,7 @@ def train(
                 ),
                 "config": cfg,
                 "num_steps": step_done,
+                "action_alignment": ACTION_ALIGNMENT,
             },
             tmp,
         )

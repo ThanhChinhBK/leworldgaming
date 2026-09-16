@@ -10,6 +10,7 @@ it isn't exercised in this training loop.
 
 from __future__ import annotations
 
+import copy
 import time
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ DEFAULTS: dict[str, Any] = {
     "num_layers": 3,
     "action_emb_dim": 16,
     "max_hp": 400.0,
+    "restrict_to_playable_actions": True,
     # Optimization
     "batch_size": 256,
     "lr": 1.0e-3,
@@ -82,6 +84,28 @@ def _sample_transition_batch(
     return view_pets(sample)
 
 
+def _snapshot_training_state(
+    dynamics: torch.nn.Module,
+    optim: torch.optim.Optimizer,
+    completed_steps: int,
+) -> dict[str, Any]:
+    return {
+        "dynamics": copy.deepcopy(dynamics.state_dict()),
+        "optim": copy.deepcopy(optim.state_dict()),
+        "num_steps": completed_steps,
+    }
+
+
+def _validate_resume_progress(checkpoint: dict[str, Any]) -> None:
+    progress = int(checkpoint.get("num_steps", 0))
+    for state in checkpoint.get("optim", {}).get("state", {}).values():
+        if "step" in state and int(state["step"]) != progress:
+            raise ValueError(
+                "PETS checkpoint optimizer progress does not match selected weights. "
+                "Preserve this legacy artifact for inference; exact resume is unsafe."
+            )
+
+
 def train(
     num_steps: int = 1000,
     config_path: str | Path | None = "configs/pets.yaml",
@@ -119,6 +143,7 @@ def train(
     start_step = 0
     if bool(cfg.get("resume", False)) and ckpt_path.exists():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        _validate_resume_progress(ckpt)
         agent.dynamics.load_state_dict(ckpt["dynamics"])
         if "optim" in ckpt:
             optim.load_state_dict(ckpt["optim"])
@@ -132,18 +157,34 @@ def train(
                 f"[train_pets] nothing to do: start_step ({start_step}) >= "
                 f"num_steps ({num_steps}). Raise --steps to continue."
             )
+            return {
+                "ckpt_path": str(ckpt_path),
+                "final_train": {},
+                "final_val": {},
+                "history": [],
+                "val_history": [],
+            }
     elif bool(cfg.get("resume", False)):
         print(f"[train_pets] --resume set but no checkpoint at {ckpt_path} — starting fresh")
 
-    def _save_ckpt(step_done: int, dest: Path) -> None:
+    def _save_ckpt(
+        step_done: int,
+        dest: Path,
+        snapshot: dict[str, Any] | None = None,
+        selected_val_mse: float | None = None,
+        total_training_steps: int | None = None,
+    ) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(dest.suffix + ".tmp")
         torch.save(
             {
-                "dynamics": agent.dynamics.state_dict(),
-                "optim": optim.state_dict(),
+                "dynamics": snapshot["dynamics"] if snapshot is not None else agent.dynamics.state_dict(),
+                "optim": snapshot["optim"] if snapshot is not None else optim.state_dict(),
                 "config": cfg,
-                "num_steps": step_done,
+                "num_steps": snapshot["num_steps"] if snapshot is not None else step_done,
+                "total_training_steps": step_done if total_training_steps is None else total_training_steps,
+                "selected_val_mse": selected_val_mse,
+                "training_state_version": 2,
             },
             tmp,
         )
@@ -165,10 +206,9 @@ def train(
         if starts.size == 0:
             raise RuntimeError("No valid transitions in replay buffer.")
         n = starts.size
-        n_val = max(int(n * float(cfg["val_split"])), batch_size)
-        n_val = min(n_val, max(n - batch_size, 0))
-        train_starts = starts[: n - n_val]
-        val_starts = starts[n - n_val :] if n_val > 0 else starts
+        train_starts, val_starts = starts.split_by_episode(
+            float(cfg["val_split"]), int(cfg["seed"])
+        )
         print(f"[train_pets] files={reader.num_files} frames={reader.total_frames} "
               f"valid_transitions={n} "
               f"train={train_starts.size} val={val_starts.size} "
@@ -199,6 +239,11 @@ def train(
         best_val_mse = [float("inf")]
         best_step = [start_step]
         best_state = [None]
+        if start_step > 0 and val_every > 0:
+            best_val_mse[0] = evaluate()["val_delta_mse"]
+            best_state[0] = _snapshot_training_state(
+                agent.dynamics, optim, start_step
+            )
         for step in range(start_step, num_steps):
             batch = _sample_transition_batch(reader, train_starts, batch_size, rng, max_hp)
             metrics = agent.learn(batch)
@@ -235,19 +280,18 @@ def train(
                 print(f"[train_pets] step={step:5d}  val  mse={vm['val_delta_mse']:.4f}")
                 if vm["val_delta_mse"] < best_val_mse[0]:
                     best_val_mse[0] = vm["val_delta_mse"]
-                    best_step[0] = step
-                    best_state[0] = {
-                        k: v.detach().clone()
-                        for k, v in agent.dynamics.state_dict().items()
-                    }
+                    best_step[0] = step + 1
+                    best_state[0] = _snapshot_training_state(
+                        agent.dynamics, optim, step + 1
+                    )
                     print(
                         f"[train_pets] step={step:5d}  new best val mse="
                         f"{vm['val_delta_mse']:.4f} -- state snapshotted (in-memory)"
                     )
 
-            if ckpt_every > 0 and step > 0 and step % ckpt_every == 0:
-                _save_ckpt(step, ckpt_path)
-                print(f"[train_pets] checkpoint saved -> {ckpt_path} (step={step})")
+            if ckpt_every > 0 and (step + 1) % ckpt_every == 0:
+                _save_ckpt(step + 1, ckpt_path)
+                print(f"[train_pets] checkpoint saved -> {ckpt_path} (step={step + 1})")
 
         elapsed = time.time() - t0
         print(f"[train_pets] done in {elapsed:.1f}s ({num_steps / max(elapsed, 1e-9):.1f} step/s)")
@@ -255,24 +299,20 @@ def train(
     finally:
         reader.close()
 
-    _save_ckpt(num_steps, ckpt_path)
-    print(f"[train_pets] saved checkpoint -> {ckpt_path}")
-
-    # Best-val-snapshot swap-in (mirrors train_lewm_heads.py's continuation-
-    # head handling): the ensemble dynamics loss is known-noisy per-batch
-    # (occasional heavy-tailed HP-swing transitions spike NLL/MSE far above
-    # the running mean) and can start mildly overfitting well before
-    # ``num_steps`` -- restoring the best-val-MSE state dict before the
-    # final save avoids shipping a checkpoint from past the point where val
-    # error was still improving.
-    if best_state[0] is not None and best_step[0] != num_steps:
-        agent.dynamics.load_state_dict(best_state[0])
-        _save_ckpt(best_step[0], ckpt_path)
+    # Keep optimizer moments and progress paired with the selected weights.
+    if best_state[0] is not None:
+        _save_ckpt(
+            best_step[0], ckpt_path, best_state[0], best_val_mse[0],
+            total_training_steps=max(start_step, num_steps),
+        )
         print(
             f"[train_pets] saved checkpoint -> {ckpt_path} "
             f"(dynamics swapped to its best-val snapshot, step={best_step[0]}, "
             f"val_delta_mse={best_val_mse[0]:.4f})"
         )
+    else:
+        _save_ckpt(max(start_step, num_steps), ckpt_path)
+        print(f"[train_pets] saved checkpoint -> {ckpt_path}")
 
     return {
         "ckpt_path": str(ckpt_path),

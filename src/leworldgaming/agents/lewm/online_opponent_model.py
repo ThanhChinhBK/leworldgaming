@@ -54,7 +54,14 @@ import numpy as np
 # Playable action-id groupings (FightingICE Action enum ints). Kept module-level
 # and lazily validated so this file imports even without pyftg present.
 _GUARD_IDS: tuple[int, ...] = (10, 11, 12)          # STAND/CROUCH/AIR_GUARD
-_EVASION_IDS: tuple[int, ...] = (2, 6, 4)           # BACK_STEP, BACK_JUMP, JUMP
+try:
+    from pyftg.models.enums.action import Action
+except ImportError:  # Keep synthetic use independent of the optional game package.
+    _EVASION_IDS: tuple[int, ...] = (4, 8, 6)
+else:
+    _EVASION_IDS = tuple(
+        getattr(Action, name).to_int() for name in ("BACK_STEP", "BACK_JUMP", "JUMP")
+    )
 # Attack ids (STAND/CROUCH/AIR normals, specials, throws) — the committal
 # actions we want to suppress when a hit is imminent and boost when it's safe.
 _ATTACK_IDS: tuple[int, ...] = (
@@ -121,8 +128,6 @@ class OnlineOpponentModel:
         own = obs.get("own", {}) or {}
         opp = obs.get("opp", {}) or {}
         g = obs.get("global", {}) or {}
-        max_hp = float(g.get("max_hp", 400) or 400)
-
         def _f(d: dict[str, Any], k: str, default: float = 0.0) -> float:
             v = d.get(k, default)
             try:

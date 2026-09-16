@@ -17,12 +17,13 @@ accumulating across the planning horizon (see ``docs/gemini_research.md``
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 import torch
 
 from leworldgaming.agents.pets.cost import analytic_reward
 from leworldgaming.agents.pets.dynamics import EnsembleDynamics
+from leworldgaming.env.action_space import mask_action_logits
 
 
 class CEMPlannerDiscrete:
@@ -37,6 +38,7 @@ class CEMPlannerDiscrete:
         sample_dynamics: bool = True,
         device: str | torch.device = "cpu",
         max_hp: float = 400.0,
+        restrict_to_playable_actions: bool = True,
     ) -> None:
         self.num_actions = int(num_actions)
         self.horizon = int(horizon)
@@ -47,6 +49,7 @@ class CEMPlannerDiscrete:
         self.sample_dynamics = bool(sample_dynamics)
         self.device = torch.device(device)
         self.max_hp = float(max_hp)
+        self.restrict_to_playable_actions = bool(restrict_to_playable_actions)
         self.eps = 1e-6
 
     @torch.no_grad()
@@ -60,10 +63,14 @@ class CEMPlannerDiscrete:
         if state.dim() == 1:
             state = state.unsqueeze(0)
         if reward_fn is None:
-            reward_fn = lambda s, s_next: analytic_reward(s, s_next, max_hp=self.max_hp)
+            def reward_fn(s, s_next):
+                return analytic_reward(s, s_next, max_hp=self.max_hp)
 
         # Per-timestep categorical logits, initialized uniform.
-        logits = torch.zeros(self.horizon, self.num_actions, device=self.device)
+        logits = mask_action_logits(
+            torch.zeros(self.horizon, self.num_actions, device=self.device),
+            self.restrict_to_playable_actions,
+        )
 
         for _ in range(self.num_iters):
             # 1. Sample N action sequences. shape: (H, N) → transpose to (N, H).
@@ -96,6 +103,6 @@ class CEMPlannerDiscrete:
                 counts = torch.bincount(elites[:, h], minlength=self.num_actions).float()
                 probs = counts / max(self.num_elites, 1)
                 new_logits[h] = torch.log(probs + self.eps)
-            logits = new_logits
+            logits = mask_action_logits(new_logits, self.restrict_to_playable_actions)
 
         return int(torch.argmax(logits[0]).item())

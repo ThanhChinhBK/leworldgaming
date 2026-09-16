@@ -291,7 +291,7 @@ def mcts_search(
             z_next_b = pred_proj(z_pred_seq[:, -1])                              # (K, D)
 
             if continuation_head is not None:
-                discount_b = gamma * torch.sigmoid(continuation_head(z_next_b)).squeeze(-1)
+                discount_b = gamma * torch.sigmoid(continuation_head(z_next_b)).reshape(k)
             else:
                 discount_b = torch.full((k,), gamma, device=device)
 
@@ -302,7 +302,7 @@ def mcts_search(
                 n.reward[a] = reward_b[i]
                 n.discount[a] = discount_b[i]
                 new_z_hist = torch.cat([n.z_hist[1:], z_next_b[i : i + 1]], dim=0)
-                new_action_hist = torch.cat([n.action_hist[1:], action_col[i]], dim=0)
+                new_action_hist = action_window[i, 1:]
                 child = _MCTSNode(new_z_hist, new_action_hist, num_actions, device)
                 child.prior = prior_b[i]
                 child.valid_mask = valid_mask
