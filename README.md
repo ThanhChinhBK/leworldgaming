@@ -1,6 +1,80 @@
 # leworldgaming
 
-Research scaffold comparing **LeWorldModel (JEPA)** against a **state-vector MBRL baseline** in **DareFightingICE**. Plan & motivation: [`docs/gemini_research.md`](docs/gemini_research.md).
+Research project comparing **LeWorldModel (JEPA)**, **DreamerV3**, and **PETS** controllers in **DareFightingICE**. Plan & motivation: [`docs/gemini_research.md`](docs/gemini_research.md).
+
+## Research report and results
+
+**Which World Model Is the Best Fighter? LeWM vs. DreamerV3 vs. PETS**
+
+Chinh Nguyen-Thanh, 2026.
+
+Read the [paper (PDF)](paper/main.pdf) or its [LaTeX source](paper/main.tex).
+This is a self-published, non-peer-reviewed research report hosted in this
+repository, not an arXiv publication; no arXiv identifier or DOI is assigned here.
+
+The report compares fixed, offline-trained controllers: pixel-based LeWM
+with CEM planning, state-vector DreamerV3 with a learned actor, and a
+state-vector PETS-style ensemble with CEM planning. Across **135 reported
+lockstep rounds**, the outcomes were:
+
+| Matchup (first controller's perspective) | Match 1 | Match 2 | Match 3 | Total wins-losses | Win rate |
+|---|---|---|---|---|---|
+| DreamerV3 vs. LeWM | 11-4 | 14-1 | 7-8 | 32-13 | 71.1% |
+| LeWM vs. PETS | 9-6 | 8-7 | 11-4 | 28-17 | 62.2% |
+| DreamerV3 vs. PETS | 15-0 | 15-0 | 15-0 | 45-0 | 100.0% |
+
+Each match contains 15 rounds. The report uses the first three completed
+matches per pair in scheduled order (45 rounds per pair), with no draws.
+The early-stopped run saved 150 completed rounds; the report excludes one
+surplus 15-0 DreamerV3/PETS match to give each pair equal coverage, as well
+as all interrupted matches. The reported subset is not a completed full
+tournament schedule.
+
+| Controller | Mean decision latency | Decisions over the 16.67 ms budget |
+|---|---|---|
+| DreamerV3 | 9.3 ms | 0.7% |
+| LeWM | 70.3 ms | 100% |
+| PETS | 126.9 ms | 100% |
+
+Latencies are weighted by decision count over the nine reported matches,
+measured on an NVIDIA GeForce RTX 5060 Ti (16 GB) and AMD Ryzen 5 3600.
+The JVM waited for both controllers on every raw frame (`--input-sync`):
+these are **lockstep control outcomes, not real-time win rates**.
+
+**Takeaway and limits.** DreamerV3 had the strongest combination of round
+outcomes and decision speed for these checkpoints, with LeWM next in round
+outcomes. This does **not** establish general architectural superiority:
+inputs, training data, and compute budgets differ; LeWM always played P1;
+and no comparison against the platform's standard search-based agent was
+performed. Only one checkpoint per method was evaluated, rounds are
+correlated, and the DreamerV3/LeWM per-match spread is substantial.
+Exact spectator-image synchronization was not verified. The planned
+100,000-step training extensions were not completed.
+
+The PDF, source, figures, and archived Dreamer training-curve CSV are
+included in `paper/`. Raw match logs, replay datasets, and model checkpoints
+remain local under ignored data paths and are not distributed with this
+repository. See [running the benchmark](#running-the-head-to-head-benchmark)
+for checkpoint requirements and protocol details.
+
+## Citation
+
+If you use this research, please cite the repository-hosted report:
+
+> Nguyen-Thanh, Chinh. (2026). *Which World Model Is the Best Fighter? LeWM vs. DreamerV3 vs. PETS*. Unpublished research report. https://github.com/ThanhChinhBK/leworldgaming
+
+```bibtex
+@misc{nguyenthanh2026bestfighter,
+  author       = {Nguyen-Thanh, Chinh},
+  title        = {Which World Model Is the Best Fighter? {LeWM} vs. {DreamerV3} vs. {PETS}},
+  year         = {2026},
+  howpublished = {GitHub repository},
+  note         = {Unpublished research report; not peer reviewed},
+  url          = {https://github.com/ThanhChinhBK/leworldgaming}
+}
+```
+
+For reproducibility, also record the commit hash of the version you used.
 
 ## Setup
 
@@ -305,18 +379,25 @@ DreamerV3 runs in **vector / proprio mode** (per `gemini_research.md` §5) — i
 
 The vendored `external/dreamerv3-torch` runs purely from the same HDF5 replay — no live env needed. The trainer exports each episode to a per-episode `.npz` file once (cached in `data/dreamer_episodes/`), then drives `WorldModel._train` + `ImagBehavior._train` directly:
 
+Exports use incoming actions: observation/reward at timestep `t` are paired
+with the action from `t-1`, with a zero initial action. Corrected checkpoints
+carry `action_alignment: incoming_action_v1`. Legacy caches are rejected
+rather than silently reused; preserve them separately and explicitly rebuild
+exports from valid original replays before starting fresh training. Legacy
+Dreamer checkpoints cannot be resumed as if they had corrected alignment.
+
 ```bash
 uv run python scripts/collect_data.py --games 5                # produce data/replay.h5
 uv run python -m leworldgaming.training.train_dreamer --num-steps 1000
 ```
 
-Defaults in `configs/dreamer.yaml`: 42-d vector observation (`DREAMER_STATE_DIM`), batch 16×64, model_lr 1e-4, actor/critic_lr 3e-5, imag_horizon 15. Inherits the upstream `dmc_proprio` encoder/decoder regex (`mlp_keys='.*'`, `cnn_keys='$^'`). Online play through `DreamerAgent.act()` is gated on `FightingIceEnv` — for now `act()` raises `NotImplementedError`.
+Defaults in `configs/dreamer.yaml`: 42-d vector observation (`DREAMER_STATE_DIM`), batch 16×64, model_lr 1e-4, actor/critic_lr 3e-5, imag_horizon 15. Inherits the upstream `dmc_proprio` encoder/decoder regex (`mlp_keys='.*'`, `cnn_keys='$^'`). Online inference is available through `scripts/play.py` and `scripts/self_play.py`, which reconstruct the trained world model and actor from the checkpoint.
 
 **Side symmetry.** State observations are canonicalized at view time so own is always on the left of opp (mirroring x / speed_x / front when needed). A model trained on P1-collected data deploys directly as P2 with no extra changes.
 
 ## Train PETS (state-vector ensemble)
 
-Probabilistic-ensemble dynamics over the 26-d continuous state primitives (`PETS_STATE_DIM`), discrete-action variant: per-step categorical CEM over the 56 actions, TS1 trajectory sampling. Reward is computed analytically from HP primitives — no learned reward head.
+Probabilistic-ensemble dynamics over the 26-d continuous state primitives (`PETS_STATE_DIM`), discrete-action variant with categorical CEM and TS-infinity trajectory sampling (one fixed ensemble member per trajectory). The network retains 56 action labels, while inference restricts decisions to commandable actions. Reward is computed analytically from HP primitives — no learned reward head. This is a PETS-style adaptation: members train on a shared batch rather than independent bootstrap datasets.
 
 ```bash
 uv run python scripts/collect_data.py --games 5               # pixels not required
@@ -339,11 +420,107 @@ uv run python scripts/train.py --agent pets    --steps 1000
 ## Smoke tests (no game required)
 
 ```bash
+make test                                       # unittest regression suite; pytest not required
 uv run python scripts/demo_state_vector.py        # primitives dict + new replay schema round-trip
 uv run python scripts/demo_lewm_synthetic.py      # full JEPA stack on random tensors (MPS/CPU)
 uv run python scripts/demo_pets_synthetic.py      # ensemble train + CEM planner end-to-end
 uv run python scripts/demo_dreamer_synthetic.py   # full Dreamer (WM + actor + critic) train step (heavy on CPU/MPS)
 ```
+
+## Running the head-to-head benchmark
+
+The [reported results](#research-report-and-results) use the corrected
+incoming-action Dreamer checkpoint saved at logged step 63,000,
+`data/dreamer_checkpoint_incoming_v1.pt`, not the legacy 71k checkpoint.
+They remain preliminary controller-level results, not a controlled
+world-model comparison.
+
+**Historical readiness audit.** The audit found
+that historical Dreamer exports supplied outgoing actions to an RSSM that
+expects incoming actions. The legacy 71k checkpoint has legacy/unknown
+alignment and is strongly implicated by its exporter/cache provenance;
+fixing the exporter cannot repair those weights. Corrected exports and
+retraining were subsequently used for the reported Dreamer controller.
+Do not substitute the legacy checkpoint when reproducing these results.
+LeWM's pixel training is P1-only, so unchanged P2 deployment is not a
+validated symmetric comparison.
+
+Checkpoints used in the report (local artifacts, not included in Git):
+
+| Model | Checkpoint | Native frame skip |
+|---|---|---|
+| LeWM, established v3 heads | `data/lewm_heads_checkpoint_stride5_m4_v3.pt` | 5 |
+| Dreamer, corrected incoming-action alignment | `data/dreamer_checkpoint_incoming_v1.pt` | 1 |
+| PETS, best validation snapshot | `data/pets_checkpoint_vsdreamer.pt` | 1 |
+
+The two original replay mounts (`/media/jeovach/New Volume/leworldgaming`
+and `/media/jeovach/Hoctap/leword-opponent`) were absent during the earlier
+audit. At that time, the local `data/replay.h5` failed the
+interleaved-perspective integrity check and held-out metrics could not be
+reproduced. Do not substitute an invalid replay. Earlier bounded live
+smoke runs also timed out on a heavily loaded host; those attempts were
+**inconclusive**, not passed integration checks. The later completed
+matches reported above do not establish held-out prediction quality.
+
+Use **explicit trained checkpoint paths**; LeWM needs a Stage-B checkpoint.
+First preview checkpoint identities and the four 60 Hz pairings per seed
+without starting games: LeWM (fixed P1) vs Dreamer, LeWM (fixed P1) vs PETS,
+and Dreamer/PETS in both player orders.
+
+```bash
+uv run python scripts/evaluate.py \
+  --lewm-ckpt data/lewm_heads_checkpoint_stride5_m4_v3.pt \
+  --dreamer-ckpt data/dreamer_checkpoint_incoming_v1.pt \
+  --pets-ckpt data/pets_checkpoint_vsdreamer.pt \
+  --out-dir data/benchmark_sync_60hz --seeds 0 1 2 --games 3 --device cuda \
+  --pace sync --dry-run
+```
+
+Removing `--dry-run` enforces readiness checks before launching matches.
+`--pace sync` is the **lockstep 60 Hz control-quality panel**: all sides
+receive the current frame and choose a new action every raw frame while the
+JVM waits. LeWM predicts five-frame latent transitions conditioned on raw
+action blocks, then re-runs CEM every frame; Dreamer and PETS use their native
+one-frame policies. This equalizes feedback decision opportunities, not
+planner compute, training modality, or LeWM player side.
+
+Repeat the same command with `--pace realtime` and a different output
+directory for the **60 Hz deadline-feasibility panel**. Its JVM does not use
+`--input-sync`, so late inference reaches the game late; do not combine its
+win rates with the synchronous panel.
+
+The runner uses Linux native rendering (`DISPLAY` defaults to `:1`).
+Each match gets its own JVM; port 31415 must be free. The runner
+never kills an existing server. With these settings this is **18 matches,
+54 games**, not a smoke test. This is a new-run example, not the report's
+early-stopped schedule, which requested five games per match and selected
+nine completed matches for analysis. Checkpoint hashes, code revision/dirty status,
+seeds, effective frame skips, raw round outcomes, and decision latency are
+saved alongside logs. Existing output directories/results are never
+overwritten, and a failed match aborts without writing a final summary.
+Keep the source revision and checkpoints frozen for the entire run; the
+runner rejects changes between matches. Execution cadence must match the
+trained timestep: historical PETS/Dreamer frame-skip overrides do not.
+Inference now restricts all three model controllers to static commandable
+actions (including NEUTRAL), without changing network shapes or weights.
+This corrects PETS/Dreamer's previous search over observation-only state
+labels; historical scores from that behavior are not directly comparable.
+
+For a single match on an already-running server, `scripts/self_play.py`
+accepts `--seed` and `--output result.json`. For a bounded native integration
+check, prefix `bash scripts/run_eval.sh ...` with
+`JVM_EXTRA='-r 1 -f 120'` (one 120-frame round); **unset `JVM_EXTRA` for final
+scores**.
+
+This measures end-to-end controller performance, **not an equal-planner
+world-model comparison**: Dreamer's actor, LeWM's planner and PETS's planner
+have different compute and observation inputs. The synchronous panel's
+reported budget overruns are informational; the real-time panel is the
+deadline result. Seeds cover Python/NumPy/Torch, not JVM internals or
+concurrent GPU scheduling.
+The original shared-planner experiment and prediction/probe axes in
+[`docs/benchmark_plan.md`](docs/benchmark_plan.md) are not implemented by this
+runner.
 
 ## Layout
 
@@ -355,4 +532,5 @@ external/            vendored research code (le-wm, dreamerv3-torch)
 docker/              JVM container (Linux training box)
 vendor/              native FightingICE install (Mac, gitignored)
 docs/                planning + research notes
+paper/               research report PDF, LaTeX source, figures, and plotting scripts
 ```
